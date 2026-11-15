@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.13.2
+// @version      2.3.16
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -119,7 +119,7 @@
       focusStopPct: 10,
       witStartPct: 80,
       witReserve: 35,
-      alternateResources: true,
+      alternateResources: false,
       mode: 'balanced', // balanced | xp | money | progression | custom
       singleTab: true, // Prevent duplicate action loops in the same browser profile
       emptyBackoffMs: 5000,
@@ -161,6 +161,12 @@
     delete S.gym.minEnergy;
   }
   removeFixedWaitLimits();
+  // One-time migration for earlier installs where resource rotation was ON
+  // by default. Leave manually configured Custom priority lists untouched.
+  if (!GM_getValue('mbx_v2316_order_migrated', false)) {
+    if (S.scheduler && S.scheduler.mode !== 'custom') S.scheduler.alternateResources = false;
+    GM_setValue('mbx_v2316_order_migrated', true);
+  }
   if (!S.scheduler || !['balanced', 'xp', 'money', 'progression', 'custom'].includes(S.scheduler.mode)) {
     S.scheduler = deepMerge(DEFAULTS.scheduler, S.scheduler || {});
     S.scheduler.mode = 'balanced';
@@ -460,6 +466,7 @@
         lastErrorAt: Number(prev.lastErrorAt) || 0,
         totalMs: Number(prev.totalMs) || 0,
         nextAllowed: 0, consecutiveErrors: 0,
+        lastCheckAt: 0, // Runtime fairness: an uninspected activity cannot be starved.
       };
     }
     return st.moduleHealth[key];
@@ -485,7 +492,7 @@
   // still permits the next eligible module to run immediately.
   const PASSIVE_MIN_CHECK_MS = {
     dailies: 180000, missions: 180000, empire: 180000, mobpass: 300000,
-    bosses: 180000, oc: 90000, smuggling: 180000, garage: 180000, trading: 180000,
+    bosses: 180000, oc: 90000, smuggling: 180000, garage: 180000, trading: 120000,
     workshop: 180000, jobs: 180000, busting: 120000, jailtime: 30000,
   };
   function resourceRecheckMs(key) {
@@ -518,6 +525,7 @@
   }
   function observeModule(key, event, elapsedMs, error) {
     const m = metric(key);
+    m.lastCheckAt = now();
     m.checks += 1;
     m.totalMs += Math.max(0, Math.round(elapsedMs || 0));
     if (event === 'action') {
@@ -2577,7 +2585,14 @@ async function garageApiSweep() {
       })
       .filter(r=>r.qty>0 && r.net>=Number(S.trading.minNetProfit||1) && r.pct>=Number(S.trading.minProfitPct||0))
       .sort((a,b)=>b.net-a.net);
-    if(!candidates.length){tradeNote(`No profitable ${tradingCityName(here)} → ${tradingCityName(dest)} load after ${money(fare)} fare; waiting for prices`);return false;}
+    if(!candidates.length){
+      const advertised=(Array.isArray(t.trade_routes)?t.trade_routes:[])
+        .filter(r=>r.type==='buy_here' && Number(r.buy_location_id)===here && Number(r.sell_location_id)===dest);
+      tradeNote(advertised.length
+        ? `No affordable/profitable ${tradingCityName(here)} → ${tradingCityName(dest)} load after ${money(fare)} fare; waiting for prices or space`
+        : `No quoted buy-and-sell route for ${tradingCityName(here)} → ${tradingCityName(dest)} in Drug Market offers; travel alone is not enough`);
+      return false;
+    }
     const best=candidates[0];
     // User explicitly requested buying only immediately before travelling.
     // Never pre-buy while travel is on cooldown.
@@ -3060,6 +3075,7 @@ async function garageApiSweep() {
       if(!role) continue;
       await POST('/oc2/join-public',{session_id:ses.id,role_id:role.id});
       ocNote('Joined '+(typeof ses.leader==='string'?ses.leader:'public')+' OC as '+(role.name||OC_ROLES[role.id]||'crew')+'; readiness verified, contributing next.','good');
+      st.ocPhase='planning';
       st.stats.ocs++;st.lastOcCheck=0;
       return true;
     }
@@ -3082,6 +3098,14 @@ async function garageApiSweep() {
     return false;
   }
 
+  // Burglary is now part of the single Crimes slot (not a separate module).
+  async function doCrimeGroup() {
+    if (S.crimes.mixEnabled && S.modules.burglary && preferredCrimeType()==='burglary') {
+      if (await doBurglary()) return true;
+    }
+    return doCrimes();
+  }
+
   const MODULE_ORDER = [
     ['dailies', doDailies],
     ['missions', doMissions],
@@ -3096,8 +3120,7 @@ async function garageApiSweep() {
     ['jobs', doJobs],
     ['heists', doHeists],
     ['gta', doGta],
-    ['burglary', doBurglary],
-    ['crimes', doCrimes],
+    ['crimes', doCrimeGroup],
     ['gym', doGym],
     ['busting', doBusting],
   ];
@@ -3109,12 +3132,13 @@ async function garageApiSweep() {
     heists:'Heists', gta:'GTA', burglary:'Burglary', crimes:'Crimes', gym:'Gym', busting:'Jail busting'
   };
   const BASE_ORDER = MODULE_ORDER.map(([key]) => key);
+  // User-defined normal priority for all built-in modes. The selected mode
+  // still controls the XP/money objective, but not the preferred activity order.
+  // Deadlines and readiness guards can temporarily promote time-sensitive work.
+  const USER_PRIORITY_ORDER = ['crimes','gta','heists','jobs','oc','workshop','gym','busting','smuggling','trading','garage','bosses','empire','mobpass','missions','dailies'];
   const STRATEGY_ORDER = {
-    balanced: BASE_ORDER,
-    // Priorities here are user choices, not assertions about actual XP or profit rates.
-    xp: ['dailies','missions','empire','mobpass','heists','gta','crimes','burglary','gym','jobs','bosses','oc','workshop','garage','smuggling','trading','busting'],
-    money: ['dailies','missions','empire','trading','garage','smuggling','bosses','oc','jobs','heists','crimes','burglary','gta','workshop','mobpass','gym','busting'],
-    progression: ['dailies','missions','empire','mobpass','gta','jobs','heists','oc','bosses','burglary','crimes','gym','workshop','garage','smuggling','trading','busting'],
+    balanced: USER_PRIORITY_ORDER, xp: USER_PRIORITY_ORDER,
+    money: USER_PRIORITY_ORDER, progression: USER_PRIORITY_ORDER,
   };
   const availableModule = Object.fromEntries(MODULE_ORDER);
   function moduleKeys() {
@@ -3146,6 +3170,34 @@ async function garageApiSweep() {
     let i=0;
     return preferredCrimeModuleFirst(keys.map(k=>[MODULE_RESOURCE[k] ? sorted[i++] : k,
       availableModule[MODULE_RESOURCE[k] ? sorted[i-1] : k]]));
+  }
+  // V2.3.14: due Drug Market trading needs a fair turn even before it has
+  // bought stock. Previously it was promoted only *after* a trade plan existed,
+  // so busy crimes/GTA/workshop loops could starve its initial buy forever.
+  // A cooldown/backoff is still authoritative; never force an early API poll.
+  function prioritizeTimeSensitiveModules(runOrder, at=now()) {
+    const raise=(key)=>{
+      const index=runOrder.findIndex(([k])=>k===key);
+      if(index>0)runOrder.unshift(...runOrder.splice(index,1));
+    };
+    // Prevent indefinite starvation: any enabled, currently eligible module
+    // which has not had a check for 2 minutes earns a fair turn. Respect
+    // individual nextAllowed backoffs, resource refill and server rate limits.
+    const overdue=runOrder
+      .filter(([key])=>S.modules[key] && at>=metric(key).nextAllowed &&
+        at-Number(metric(key).lastCheckAt||0)>=120000)
+      .sort(([a],[b])=>Number(metric(a).lastCheckAt||0)-Number(metric(b).lastCheckAt||0))[0];
+    if(overdue)raise(overdue[0]);
+    const tradingDue=S.modules.trading && at>=metric('trading').nextAllowed &&
+      (tradePlan() || tradePending() || at-Number(st.lastTradeCheck||0)>=120000);
+    if(tradingDue)raise('trading');
+    if(S.modules.smuggling && at-Number(st.lastSmuggleCheck||0)>=Number(S.smuggling.checkMinutes||5)*60000 &&
+       at>=metric('smuggling').nextAllowed)raise('smuggling');
+    // Never make a crew wait behind routine work when an OC is active or
+    // preparing a contribution. An actual OC cooldown still wins.
+    if(S.modules.oc && (st.ocPhase==='active' || st.ocPhase==='planning') &&
+       at>=metric('oc').nextAllowed)raise('oc');
+    return runOrder;
   }
   function setStrategy(mode) {
     if (!['balanced','xp','money','progression','custom'].includes(mode)) return;
@@ -3954,14 +4006,7 @@ async function garageApiSweep() {
       if (st.paused) { log(`Back out (${st.paused.reason}) - resuming`, 'good'); st.paused = null; }
 
       const runOrder=prioritizedModules();
-      if(S.modules.trading && (tradePlan()||tradePending())){
-        const idx=runOrder.findIndex(([key])=>key==='trading');
-        if(idx>0)runOrder.unshift(...runOrder.splice(idx,1));
-      }
-      if(S.modules.smuggling && now()-st.lastSmuggleCheck>=S.smuggling.checkMinutes*60000){
-        const idx=runOrder.findIndex(([key])=>key==='smuggling');
-        if(idx>0)runOrder.unshift(...runOrder.splice(idx,1));
-      }
+      prioritizeTimeSensitiveModules(runOrder);
       for (const [key, fn] of runOrder) {
         if (!S.modules[key]) continue;
         const m = metric(key);
@@ -4386,7 +4431,7 @@ async function garageApiSweep() {
       renderStatus();renderStats();
     } else if (tab === 'modules') {
       const groups=[
-        ['Core activities', [['crimes','Crimes','Use nerve for the best available crime'],['burglary','Burglaries','Case and attempt jobs'],['gta','GTA','Steal cars using focus'],['heists','Heists','Spend wit on heists'],['gym','Gym','Train when energy is available'],['jailtime','Jail activities','Train and work while in jail']]],
+        ['Core activities', [['crimes','Crimes (including burglary)','Rotate through pickpocketing, car break-ins, shoplifting and burglary'],['gta','GTA','Steal cars using focus'],['heists','Heists','Spend wit on heists'],['gym','Gym','Train when energy is available'],['jailtime','Jail activities','Train and work while in jail']]],
         ['Money and items', [['jobs','Jobs','Eligible criminal jobs'],['empire','Empire','Collect earnings'],['workshop','Workshop','Items first, selected drugs if nothing craftable'],['smuggling','Smuggling','Run profitable deliveries'],['garage','Garage','Protect cargo cars and crush local low-capacity cars'],['trading','Drug trading','Buy and sell at a profit']]],
         ['Rewards and special', [['dailies','Daily objectives','Claim finished rewards'],['missions','Missions','Claim completed missions'],['mobpass','MOB Pass','Claim earned pass rewards'],['bosses','Bosses','Fight eligible Mob bosses'],['oc','Organised crime','Join and contribute to OCs'],['busting','Jail busting','Help prisoners escape']]],
       ];
@@ -4471,7 +4516,7 @@ async function garageApiSweep() {
       <div class="action-row"><button class="soft-btn" data-go="health">Health and diagnostics</button><button class="soft-btn" data-go="options">Back to simple options</button></div>`;
       bd.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>{S.panel.tab=b.dataset.go;save();renderBody();});
     } else if (tab === 'strategy') {
-      const options = [['balanced','Balanced (original order)'],['xp','XP focus'],['money','Money focus'],
+      const options = [['balanced','Balanced (your priority order)'],['xp','XP focus'],['money','Money focus'],
         ['progression','Progression'],['custom','Custom priority']];
       const selected = S.scheduler.mode || 'balanced';
       bd.innerHTML = `
@@ -4755,7 +4800,9 @@ async function garageApiSweep() {
     if(nextEl)nextEl.textContent=S.running?(dueAt>now()?fmt(Math.ceil((dueAt-now())/1000)):'Now'):'Paused';
     const currentEl=root.querySelector('#mbx-current-action');
     if(currentEl)currentEl.textContent=!S.running?'Stopped':st.busy && st.activeModule?(MODULE_NAMES[st.activeModule]||st.activeModule):'Idle / waiting';
-    const eligible=moduleKeys().filter(k=>S.modules[k]).map(k=>({key:k,at:Number(metric(k).nextAllowed||0)}))
+    const eligible=prioritizeTimeSensitiveModules(prioritizedModules())
+      .map(([key])=>({key,at:Number(metric(key).nextAllowed||0)}))
+      .filter(x=>S.modules[x.key])
       .sort((a,b)=>a.at-b.at);
     const nextKey=eligible.find(x=>x.at<=Math.max(now(),dueAt)+1500)?.key || eligible[0]?.key;
     const nm=root.querySelector('#mbx-next-module');if(nm)nm.textContent=!S.running?'Paused':nextKey?(MODULE_NAMES[nextKey]||nextKey):'No modules enabled';
