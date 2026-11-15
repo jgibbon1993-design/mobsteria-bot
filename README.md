@@ -1,6 +1,6 @@
 # Mobsteria Bot — stable Tampermonkey releases
 
-Latest stable: **v2.3.13.2**.
+Latest stable: **v2.3.16**.
 
 ## Install or update once
 
