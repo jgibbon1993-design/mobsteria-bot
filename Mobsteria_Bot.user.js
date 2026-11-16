@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.18
+// @version      2.3.19
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -83,6 +83,7 @@
       // Join a suitable public OC first. If none exists, only prepare/host
       // a PUBLIC five-human-seat lobby using verified visible form controls.
       hostPublicFive: true, hostOperation: 'Sporting Goods Robbery',
+      preferredOperations: ['Import Dock Raid', 'Sporting Goods Robbery', 'Casino Robbery'],
       startWhenReady: true },
     gta: { mode: 'mastery' },          // 'mastery' = push unlock of next job, 'best' = best success
     heists: { keepWit: 0 }, // effective OC reserve is configured in scheduler.witReserve
@@ -232,7 +233,8 @@
     S.crimes=deepMerge(DEFAULTS.crimes,S.crimes||{});
     S.oc=deepMerge(DEFAULTS.oc,S.oc||{});
     if(!Array.isArray(S.oc.roles))S.oc.roles=[4,2,3,5];
-    if(!['Sporting Goods Robbery','Casino Robbery'].includes(S.oc.hostOperation))S.oc.hostOperation='Sporting Goods Robbery';
+    // Apply the requested order to previously saved bot settings.
+    S.oc.preferredOperations=['Import Dock Raid','Sporting Goods Robbery','Casino Robbery'];
     S.garage=deepMerge(DEFAULTS.garage,S.garage||{});
     S.garage.minBaseCapacity=Math.max(1,Math.min(500,Math.round(Number(S.garage.minBaseCapacity)||60)));
     S.garage.checkMinutes=Math.max(10,Math.min(240,Math.round(Number(S.garage.checkMinutes)||45)));
@@ -2995,6 +2997,18 @@ async function garageApiSweep() {
   }
   // Hosting uses ONLY observed UI controls. It never invents an /oc2/create
   // endpoint or submits a private/two-player OC when form state is uncertain.
+  const OC_PRIORITY=['Import Dock Raid','Sporting Goods Robbery','Casino Robbery'];
+  function ocOperationRank(label) {
+    const s=String(label||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    const variants=[/import\s+dock\s+raid|dock\s+raid/,/sporting\s+goods/,/casino\s+(?:heist|robbery)|casino/];
+    const i=variants.findIndex(re=>re.test(s));
+    return i<0?OC_PRIORITY.length:i;
+  }
+  function ocSessionOperation(session) {
+    return session?.operation?.name ?? session?.operation_name ?? session?.operationName ??
+      session?.crime_type?.name ?? session?.crime_type ?? session?.type?.name ??
+      session?.operation ?? session?.type ?? '';
+  }
   function ocHostPublicFive() {
     if(!S.oc.hostPublicFive)return false;
     if(!/^\/game\/organised-crime\/?$/.test(location.pathname)) {
@@ -3029,11 +3043,16 @@ async function garageApiSweep() {
       (sizeControl.tagName==='SELECT' && String(sizeControl.value)==='5') ||
       (sizeControl.tagName==='INPUT' && String(sizeControl.value)==='5') ||
       (sizeControl.getAttribute('aria-pressed')==='true' && /\b5\b/.test(ocElementText(sizeControl))));
-    const operation=S.oc.hostOperation;
-    // Require selected operation in a form control or an accessible pressed state.
+    // Select highest-priority operation that is actually visible and enabled.
     const opControl=fields.find(el=>/operation|type/i.test(String([el.getAttribute('aria-label'),el.getAttribute('name'),el.id].join(' '))));
+    const availableOps=opControl?.tagName==='SELECT' ? [...opControl.options]
+      .map(opt=>({label:ocElementText(opt),value:opt.value,rank:ocOperationRank(ocElementText(opt))}))
+      .filter(opt=>opt.rank<OC_PRIORITY.length && !opt.disabled)
+      .sort((a,b)=>a.rank-b.rank) : [];
+    const preferredOption=availableOps[0]||null;
+    const operation=preferredOption?.label||OC_PRIORITY[0];
     const operationSelected=!!opControl && (
-      String(opControl.value||'').toLowerCase().includes(operation.toLowerCase()) ||
+      (preferredOption!=null && String(opControl.value||'')===String(preferredOption.value)) ||
       (opControl.tagName==='SELECT' && [...opControl.selectedOptions].some(opt=>
         ocElementText(opt).toLowerCase().includes(operation.toLowerCase()))) ||
       (opControl.getAttribute('aria-pressed')==='true' && ocElementText(opControl).toLowerCase().includes(operation.toLowerCase())));
@@ -3060,7 +3079,7 @@ async function garageApiSweep() {
       }
     }
     if(publicSelected && fiveSelected && !operationSelected && opControl?.tagName==='SELECT'){
-      const option=[...opControl.options].find(opt=>ocElementText(opt).toLowerCase().includes(operation.toLowerCase()));
+      const option=[...opControl.options].find(opt=>opt.value===preferredOption?.value);
       if(option){opControl.value=option.value;opControl.dispatchEvent(new Event('change',{bubbles:true}));
         ocNote('Selected '+operation+'; verifying the updated form.');return true;}
     }
@@ -3201,7 +3220,9 @@ async function garageApiSweep() {
     const pref=(S.oc.roles||[]).map(Number);
     // Research preference: public first, then eligible invitations, then host.
     const publicSource=o.publicSessions||o.public_sessions||[];
-    const publicLobbies=Array.isArray(publicSource)?publicSource:Object.values(publicSource);
+    const publicLobbies=(Array.isArray(publicSource)?publicSource:Object.values(publicSource))
+      .filter(Boolean).map((ses,index)=>({ses,index,rank:ocOperationRank(ocSessionOperation(ses))}))
+      .sort((a,b)=>a.rank-b.rank||a.index-b.index).map(x=>x.ses);
     for(const ses of publicLobbies) {
       if(ses.can_join===false || !ocSameLocation(ses,o)) continue;
       const ar=await GET(`/oc2/session/${ses.id}/available-roles`);
@@ -4837,8 +4858,8 @@ async function garageApiSweep() {
           <div class="tog"><span>Contribute automatically</span><div class="sw" data-b="oc.contribute"></div></div>
           <div class="tog"><span>Host public five-player OC if none is joinable</span><div class="sw" data-b="oc.hostPublicFive"></div></div>
           <div class="tog"><span>Start only after all five real players are Ready</span><div class="sw" data-b="oc.startWhenReady"></div></div>
-          <label class="f">Public OC to host (if the live form can be verified)</label>
-          <select data-k="oc.hostOperation"><option value="Sporting Goods Robbery">Sporting Goods Robbery</option><option value="Casino Robbery">Casino Robbery</option></select>
+          <label class="f">Preferred OC order (highest first)</label>
+          <div class="mini-note">Import Dock Raid → Sporting Goods Robbery → Casino Heist. Joins prioritise recognised operations; hosting selects the highest available choice in the verified live form.</div>
           <div class="mini-note">The bot only joins seats whose live readiness says you can contribute. If a planning seat cannot be funded and nothing was submitted, it tries the verified Leave control and another role. Hosting is held unless a usable Leader item is verified—never block other players with an unfunded lobby. No NPC/Points fallback.</div>
           <div class="tog"><span>Attack your solo boss</span><div class="sw" data-b="bosses.solo"></div></div>
           <div class="tog"><span>Attack the world boss</span><div class="sw" data-b="bosses.world"></div></div>`),
