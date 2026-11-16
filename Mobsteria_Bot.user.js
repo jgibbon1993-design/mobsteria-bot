@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.19
+// @version      2.3.20
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -96,7 +96,7 @@
     // Garage uses visible game controls only: no guessed garage endpoints.
     // Keep 60+ base cargo cars for smuggling. Never unlock cars automatically.
     garage: { minBaseCapacity: 60, checkMinutes: 45, maxCrushTotalFee: 100000,
-      protect: true, crushLocal: true, repair: true, upgradeCapacity: true,
+      protect: true, crushLocal: true, repair: true, upgradeCapacity: true, shipAfterCrushToA: true,
       navigateToGarage: true, maxRepairCost: 25000,
       maxCapacityUpgradeCost: 25000, keepCash: 50000 },
     busting: { alwaysCrew: true, maxPerMinute: 4 },
@@ -1915,6 +1915,19 @@ async function garageApiSweep() {
   // smuggling state is not safe to destroy merely to free capacity.
   const selected=local.filter(c=>!c.locked&&!c.moving&&!c.busy&&!c.upgraded&&
     c.cap<min && (!c.listing || c.listing.is_available===true));
+  // Keep shipping after crushing, and tie destination to Trading City A.
+  // Do not guess an undocumented shipping API or payload.
+  if(selected.length===0 && S.garage.shipAfterCrushToA){
+    const target=TRADING_CITIES.find(c=>c.id===Number(S.trading.cityA));
+    const destination=target&&garageApiLocation(target.name);
+    const remaining=cars.filter(c=>!c.moving&&!c.busy&&c.city!==destination);
+    const processing=rows.some(raw=>/crush|queue|processing/i.test(String(raw.status||raw.crusher_status||'')));
+    if(target&&remaining.length&&!processing){
+      garageWarn('Crushing complete; '+remaining.length+' remaining eligible cars should ship to City A ('+
+        target.name+'). Shipping request not yet verified; no unconfirmed shipment submitted');
+      return false;
+    }
+  }
   const fee=Number(first?.crusher?.price_per_car);
   if(first?.crusher?.available!==true||!Number.isFinite(fee)||fee<=0){
     garageWarn('Crusher unavailable or fee unverified');return false;
@@ -4806,6 +4819,7 @@ async function garageApiSweep() {
         sec('garage', 'Garage and smuggling cars', `
           <div class="mini-note">Only acts on confirmed visible Garage rows. Cargo capacity 60+ is protected. Crushing is local to your current district; no travel for crushing. User locks are never removed.</div>
           <div class="tog"><span>Lock high-capacity cars automatically</span><div class="sw" data-b="garage.protect"></div></div>
+          <div class="tog"><span>Ship remaining cars to trading City A after crushing (requires verified shipping action)</span><div class="sw" data-b="garage.shipAfterCrushToA"></div></div>
           <div class="tog"><span>Crush unprotected local low-capacity cars</span><div class="sw" data-b="garage.crushLocal"></div></div>
           <div class="tog"><span>Repair all damaged cars before crushing</span><div class="sw" data-b="garage.repair"></div></div>
           <div class="tog"><span>Capacity upgrades on visible Smuggling Upgrades tab</span><div class="sw" data-b="garage.upgradeCapacity"></div></div>
