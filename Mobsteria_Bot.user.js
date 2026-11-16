@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.16
+// @version      2.3.18
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -76,8 +76,8 @@
     // Mission claims are free; changing active missions or starting a challenge is never automatic.
     missions: { claimVisible: true, navigateToCheck: false, checkMinutes: 5 },
     // Drug trading runs: buy where cheap, travel, sell where dear. Also sells crafted drugs at the best market.
-    // The pair is deliberately unset until its owner selects BOTH cities.
-    trading: { cityA:0, cityB:0, minProfitPct: 0, minNetProfit: 1, keepCash: 0, maxRisk: 20, sellCrafted: true, sellInventory: true },
+    // Default paired route: A Silverton, B The Docks; saved custom routes remain unchanged.
+    trading: { cityA:1, cityB:2, loopTravel:true, minProfitPct: 0, minNetProfit: 1, keepCash: 0, maxRisk: 20, sellCrafted: true, sellInventory: true },
     // Organised crime: join public OCs (and accept invites) in your preferred roles
     oc: { roles: [4, 2, 3, 5], acceptInvites: true, travel: false, contribute: true,
       // Join a suitable public OC first. If none exists, only prepare/host
@@ -210,6 +210,7 @@
     S.smuggling=deepMerge(DEFAULTS.smuggling,S.smuggling||{});
     S.trading=deepMerge(DEFAULTS.trading,S.trading||{});
     for(const k of ['cityA','cityB']){const id=Number(S.trading[k])||0;S.trading[k]=TRADING_CITIES.some(c=>c.id===id)?id:0;}
+    S.trading.loopTravel=S.trading.loopTravel!==false;
     S.trading.minProfitPct=Math.max(0,Math.min(1000,Number(S.trading.minProfitPct)||0));
     S.trading.minNetProfit=Math.max(1,Number(S.trading.minNetProfit)||1);
     S.trading.keepCash=Math.max(0,Number(S.trading.keepCash)||0);
@@ -241,6 +242,16 @@
     S.garage.keepCash=Math.max(0,Number(S.garage.keepCash)||0);
   }
   normalizeResearchOptions();
+  // Set Silverton / The Docks as defaults for existing accounts where neither
+  // side was configured. Never overwrite a user's saved custom city pair.
+  if(!GM_getValue('mbx_v2318_pair_defaults_migrated',false)){
+    if(!S.trading.cityA && !S.trading.cityB){
+      S.trading.cityA=1; // Silverton
+      S.trading.cityB=2; // The Docks
+      GM_setValue(STORE_KEY,JSON.stringify(S));
+    }
+    GM_setValue('mbx_v2318_pair_defaults_migrated',true);
+  }
   // Explicitly requested Empire collection: older installations had navigation OFF,
   // so the module never reached the Empire page. Migrate once; thereafter the
   // user can turn it off normally in Advanced settings.
@@ -359,7 +370,8 @@
     resourceObservations: {},
     resourceRegenPerMin: {},
     lastTradeCheck: 0,
-    tradeStatus: 'Checking market inventory and selected two-city route',
+    tradeTravelReadyAt: 0,
+    tradeStatus: 'Checking two-city travel cooldown and optional drug cargo',
     tradePending: null,
     ocExcluded: safeParse(GM_getValue(OC_EXCLUDED_ROLES_KEY,'{}'))||{},
     ocExitHold: safeParse(GM_getValue(OC_UNFUNDED_EXIT_KEY,'null')),
@@ -519,7 +531,13 @@
     if(key==='oc' && st.ocPhase==='active') return 5000;
     if(key==='oc' && st.ocPhase==='planning') return 45000;
     if(key==='empire')return Math.max(120000,Number(S.empire.checkMinutes||15)*60000);
-    if(key==='trading' && (tradePlan()||tradePending()))return 30000;
+    if(key==='trading'){
+      if(tradePlan()||tradePending()||tradeTravelPending())return 25000;
+      if(tradingPair() && S.trading.loopTravel){
+        const remaining=st.tradeTravelReadyAt-now();
+        return remaining>0?Math.max(10000,Math.min(180000,remaining+1000)):25000;
+      }
+    }
     if (MODULE_RESOURCE[key]) return resourceRecheckMs(key);
     return PASSIVE_MIN_CHECK_MS[key]||120000;
   }
@@ -1787,8 +1805,12 @@ async function garageApiSweep() {
     const moving=!!raw.shipping_end_time||!!(ship&&typeof ship==='object'&&(garageFlag(ship.required)||garageFlag(ship.expired)));
     const listing=vehicles.get(id);
     const upgraded=listing&&garageApiHasUpgrades(listing);
+    // The game's GTA garage uses damage_percentage > 0 and repair_cost
+    // (verified in its captured JavaScript). Do not guess a missing value.
+    const damage=raw.damage_percentage==null?NaN:Number(raw.damage_percentage);
+    const repairCost=raw.repair_cost==null?NaN:Number(raw.repair_cost);
     cars.push({id,cap,city,locked:garageFlag(raw.locked),moving,upgraded:!!upgraded,
-      busy:busy.has(id),listing});
+      busy:busy.has(id),listing,damage,repairCost});
   }
   // Protect every high-capacity car, including those located on a hidden page.
   const lockTarget=S.garage.protect && cars.find(c=>!c.locked && (c.cap>=min||c.upgraded));
@@ -1804,7 +1826,6 @@ async function garageApiSweep() {
     return true;
   }
   const local=cars.filter(c=>c.city===home);
-  if(!local.length){garageWarn('Scanned '+pages+' pages: no cars in '+home);return false;}
   // Reserve a working car for smuggling if no already-locked eligible local car exists.
   if(S.modules.smuggling && S.garage.protect){
     const hasProtected=local.some(c=>c.locked&&!c.busy&&!c.moving&&c.listing?.is_available===true);
@@ -1822,6 +1843,68 @@ async function garageApiSweep() {
       }
     }
   }
+  // V2.3.17: Repair EVERY damaged garage car before crushing ANY car.
+  // The captured GTA2 game bundle verifies POST /garage/repair with
+  // {carIds:[...]} and provides damage_percentage and repair_cost. Check
+  // all garage pages, including protected/high-capacity and remote cars.
+  // A pending/unaffordable/unknown repair BLOCKS crushing, rather than
+  // destroying a damaged vehicle or silently skipping it.
+  if(cars.some(c=>!Number.isFinite(c.damage)||c.damage<0||c.damage>100)){
+    garageWarn('Repair-first blocked: garage damage data incomplete; no cars crushed');return false;
+  }
+  const damaged=cars.filter(c=>c.damage>0);
+  if(damaged.length){
+    if(!S.garage.repair){
+      garageWarn(damaged.length+' damaged cars remain; enable Garage repairs before crushing');return false;
+    }
+    if(damaged.some(c=>!Number.isFinite(c.repairCost)||c.repairCost<0)){
+      garageWarn('Repair-first blocked: a damaged car has no verified repair price');return false;
+    }
+    // Never submit repair requests for vehicles still moving/in a mission.
+    // Even if other cars are repairable, the crusher waits until ALL are done.
+    const available=damaged.filter(c=>!c.moving&&!c.busy);
+    const maxPerCar=Number(S.garage.maxRepairCost);
+    const limit=Number(st.char?.money)-num(S.garage.keepCash);
+    if(!Number.isFinite(maxPerCar)||maxPerCar<0||!Number.isFinite(limit)){
+      garageWarn('Repair-first blocked: repair budget or available cash unknown');return false;
+    }
+    // Local crusher candidates first; then all other damaged cars including
+    // protected and remote vehicles. Repairs are ID-selective, never repair-all.
+    available.sort((a,b)=>Number(b.city===home)-Number(a.city===home)||a.id-b.id);
+    const batch=[];
+    let batchCost=0;
+    for(const c of available){
+      if(batch.length>=8)break;
+      if(c.repairCost>maxPerCar)continue;
+      if(batchCost+c.repairCost>limit)continue;
+      batch.push(c);batchCost+=c.repairCost;
+    }
+    if(!batch.length){
+      const busyCount=damaged.length-available.length;
+      const overCap=available.filter(c=>c.repairCost>maxPerCar).length;
+      garageWarn('Repair-first blocked: '+damaged.length+' damaged cars ('+busyCount+
+        ' busy/in transit, '+overCap+' over $'+maxPerCar.toLocaleString()+
+        ' repair limit); cash reserve/repair availability must be satisfied');
+      return false;
+    }
+    const repairIds=batch.map(c=>c.id);
+    garageHold('repair',repairIds.join(','),{phase:'api-pending',type:'selected',
+      ids:repairIds,count:repairIds.length,cost:batchCost,at:now()});
+    // Store the hold BEFORE the paid call, and do not repeat it if uncertain.
+    await POST('/garage/repair',{carIds:repairIds});
+    const after=await garageApiInventory();
+    const afterById=new Map(after.rows.map(c=>[garageId(c?.id),Number(c?.damage_percentage)]));
+    if(!repairIds.every(id=>afterById.has(id)&&afterById.get(id)===0)){
+      garageWarn('Repair response unconfirmed for '+repairIds.length+
+        ' cars; no crushing or blind repair retry');return false;
+    }
+    st.garageHold=null;GM_setValue(GARAGE_HOLD_KEY,'null');
+    st.lastGarageCheck=0;
+    garageWarn('Verified repair of '+repairIds.length+' cars ($'+batchCost.toLocaleString()+
+      '); '+(damaged.length-repairIds.length)+' damaged remain, crusher waits for all');
+    return true;
+  }
+  if(!local.length){garageWarn('Scanned '+pages+' garage pages: none in '+home);return false;}
   if(!S.garage.crushLocal){garageWarn('Scanned '+pages+' garage pages; crushing disabled');return false;}
   if(S.modules.oc && ['active','planning'].includes(st.ocPhase)){
     garageWarn('OC underway; preserving possible driver cars until finished');return false;
@@ -1861,6 +1944,31 @@ async function garageApiSweep() {
 }
 
   async function doGarage() {
+    // An uncertain paid repair is never submitted twice, even after the
+    // usual 10-minute garage hold expires. Re-check the authoritative Garage
+    // inventory for the same IDs and resume only after every one reads 0%.
+    if(st.garageHold?.kind==='repair'&&st.garageHold?.phase==='api-pending'){
+      const hold=st.garageHold;
+      if(now()-num(st.lastRepairRecheckAt)<120000)return false;
+      st.lastRepairRecheckAt=now();
+      try{
+        const snapshot=await garageApiInventory();
+        const damaged=new Map(snapshot.rows.map(c=>[garageId(c?.id),
+          c?.damage_percentage==null?NaN:Number(c.damage_percentage)]));
+        const ids=Array.isArray(hold.ids)?hold.ids:[];
+        if(ids.length&&ids.every(id=>damaged.has(id)&&damaged.get(id)===0)){
+          st.garageHold=null;GM_setValue(GARAGE_HOLD_KEY,'null');
+          st.lastGarageCheck=0;
+          garageWarn('Verified previously pending repairs for '+ids.length+' cars; resuming garage');
+          return true;
+        }
+        garageWarn('Repair is unconfirmed for '+ids.length+
+          ' cars; no repeated paid repairs or crushing until they are verified');
+      }catch(err){
+        garageWarn('Repair verification unavailable; no repeat repair or crushing: '+String(err?.message||err));
+      }
+      return false;
+    }
     // Pending confirmation takes precedence over the ordinary 45-minute
     // cadence. Never ignore a paid confirmation behind the hold guard.
     if(st.garageHold?.kind==='crush'&&st.garageHold?.phase==='confirm'){
@@ -1946,18 +2054,8 @@ async function garageApiSweep() {
             return true;
           }
         }
-        if(S.garage.repair){
-          for(const car of local){
-            if(car.base<S.garage.minBaseCapacity||!car.locked||car.busy)continue;
-            const btn=[...car.row.querySelectorAll('button')].find(b=>garageVisible(b)&&/\brepair\b/i.test(garageText(b)));
-            if(!btn)continue;
-            const price=garageMoneyNear(garageText(btn)+' '+car.text,'repair');
-            if(!garageCashAllows(price,S.garage.maxRepairCost))continue;
-            garageHold('repair',car.text.slice(0,80));
-            btn.click();garageWarn('Requested repair for protected '+car.base+'-capacity car ($'+price+'); verify result');
-            st.lastGarageCheck=0;return true;
-          }
-        }
+        // All repairs are performed and verified across Garage API pages
+        // before this point; do not duplicate a paid DOM repair click.
         // The legacy Crush All path is deliberately unused; it cannot prove
         // what hidden pages contain. The ID-selective API is authoritative.
         return false;
@@ -2456,6 +2554,16 @@ async function garageApiSweep() {
     const key=tradeStorageKey('trade_pending');
     return key ? safeParse(GM_getValue(key,'null')) : null;
   }
+  // Per-character travel hold prevents duplicate fares on successful, delayed,
+  // or ambiguous network responses. Never transfer plans between accounts.
+  function tradeTravelPending() {
+    const key=tradeStorageKey('travel_pending');
+    return key ? safeParse(GM_getValue(key,'null')) : null;
+  }
+  function setTradeTravelPending(p) {
+    const key=tradeStorageKey('travel_pending');
+    if(key)GM_setValue(key,JSON.stringify(p));
+  }
   function setTradePending(p) {
     const key=tradeStorageKey('trade_pending');
     if(key)GM_setValue(key,JSON.stringify(p));
@@ -2505,101 +2613,131 @@ async function garageApiSweep() {
     return true;
   }
   async function doTrade() {
+    // Travel is the purpose of this paired-city loop. Profitable drugs are a
+    // bonus, never a prerequisite for travelling between the chosen cities.
     if(now()-st.lastTradeCheck<25000)return false;
     st.lastTradeCheck=now();
     const t=await GET('/drug-trade');
     const here=Number(t?.location?.id);
     if(!here){tradeNote('Current market district is not verified');return false;}
-    const plan=tradePlan();
-    if(!reconcileTradeRequest(t))return false;
-    const items=currentTradeInventory(t).filter(i=>Number(i.quantity)>0);
-    const maxTx=Math.max(1,Number(t.trade_limits?.max_per_transaction)||500);
-    const canTrade=Number(t.trade_limits?.seconds_until_trade||0)<=0 && !t.jail_status?.is_jailed && !t.hospital?.isInHospital;
     const pair=tradingPair();
-    const planned=plan && items.find(i=>Number(i.drug_id)===Number(plan.drug_id));
-
-    // 1. An intentionally purchased delivery gets ONE chance to travel to its
-    // chosen, paired destination. An old/inconsistent plan is liquidated locally.
-    if(planned && pair && pair.includes(here) && pair.includes(Number(plan.sell_location_id)) &&
-       here!==Number(plan.sell_location_id) && now()-Number(plan.at||0)<20*60000){
-      const tr=await GET('/transit');
-      const city=(tr.districts||[]).find(d=>Number(d.id)===Number(plan.sell_location_id));
-      if(tr.cooldown?.is_on_cooldown){tradeNote(`Holding planned load: travel cooldown ${Math.ceil(Number(tr.cooldown.remaining_seconds||0)/60)}m`);return false;}
-      if(!city || city.is_locked){tradeNote('Chosen destination is locked/unavailable — will sell stock here when plan expires','warn');return false;}
-      if(Number(tr.contraband?.inspection_risk||0)>Number(S.trading.maxRisk)){
-        tradeNote('Drug inspection risk too high; will liquidate planned stock locally','warn');setTradePlan(null);
-      }else if(Number(t.money)<Number(city.travel_cost||0)+Number(S.trading.keepCash)){
-        tradeNote('Insufficient cash for destination fare; selling stock locally','warn');setTradePlan(null);
-      }else{
-        // Clear the outstanding plan only upon delivery; the next market
-        // snapshot in the destination will confirm arrival and sell the cargo.
-        const reply=await POST(`/transit/${city.id}`);
-        if(reply?.success===false || reply?.error){tradeNote('Travel rejected: '+(reply.error||reply.message||'unknown'),'warn');return false;}
-        st.lastCharAt=0;st.lastTradeCheck=0;
-        tradeNote(`Travelling to ${city.name} with ${planned.quantity} ${planned.name} to sell`,'good');
-        return true;
-      }
-    }
-
-    // 2. Any held drugs, whether crafted, rewarded or purchased manually,
-    // are sold at the CURRENT district's verified sell price. We do not
-    // take them on a speculative third-city trip or wait for a buy_here route.
-    // This also clears inventory before buying an intentionally planned load.
-    if(items.length && S.trading.sellInventory){
-      if(!canTrade){tradeNote(`Have stock to sell; market cooldown ${Math.ceil(Number(t.trade_limits?.seconds_until_trade||0))}s`);return false;}
-      const sale=items.map(inv=>({inv,drug:tradePrice(t,inv.drug_id)}))
-        .filter(x=>x.drug && Number(x.drug.sell_price)>0)
-        .sort((a,b)=>Number(b.drug.sell_price)*Number(b.inv.quantity)-Number(a.drug.sell_price)*Number(a.inv.quantity))[0];
-      if(!sale){tradeNote('Holding drugs but no verified local sell prices — not guessing','warn');return false;}
-      if(plan && Number(plan.drug_id)===Number(sale.inv.drug_id))setTradePlan(null);
-      return tradeRequest('sell',sale.drug,Math.min(maxTx,Math.floor(Number(sale.inv.quantity))),t);
-    }
-    if(items.length){tradeNote('Drugs held; automatic liquidation is disabled');return false;}
-    if(plan)setTradePlan(null);
-
-    // 3. Require a user-selected city pair BEFORE paid travel or buying cargo.
     if(!pair){tradeNote('Choose two different trading cities in Options → Drug trading');return false;}
     if(!pair.includes(here)){
-      tradeNote(`Currently in ${t.location?.name||'another district'}, outside selected ${tradingCityName(pair[0])} ↔ ${tradingCityName(pair[1])}; no unplanned travel`);
+      tradeNote(`In ${t.location?.name||'another district'}, outside ${tradingCityName(pair[0])} ↔ ${tradingCityName(pair[1])}; no third-city travel`);
       return false;
     }
-    if(!canTrade){tradeNote(`Market cooldown ${Math.ceil(Number(t.trade_limits?.seconds_until_trade||0))}s`);return false;}
     const dest=pair.find(id=>id!==here);
+    let travelHold=tradeTravelPending();
+    if(travelHold && Number(travelHold.to)===here){
+      setTradeTravelPending(null);
+      travelHold=null;
+      st.tradeTravelReadyAt=0;
+      tradeNote(`Arrived in ${tradingCityName(here)}; next leg ${tradingCityName(dest)}`,'good');
+    }
+    // A successful or uncertain POST may leave the old location visible briefly.
+    // Never send a second fare request while the first leg could still be in flight.
+    if(travelHold && now()-Number(travelHold.at||0)<120000){
+      tradeNote(`Checking arrival from ${tradingCityName(travelHold.from)} to ${tradingCityName(travelHold.to)}; no duplicate travel`);
+      return false;
+    }
+    const inventorySettled=reconcileTradeRequest(t);
+    const items=currentTradeInventory(t).filter(i=>Number(i.quantity)>0);
+    const maxTx=Math.max(1,Number(t.trade_limits?.max_per_transaction)||500);
+    const canTrade=Number(t.trade_limits?.seconds_until_trade||0)<=0 &&
+      !t.jail_status?.is_jailed && !t.hospital?.isInHospital;
     const tr=await GET('/transit');
     const city=(tr.districts||[]).find(d=>Number(d.id)===dest);
     if(!city || city.is_locked){tradeNote(`Selected ${tradingCityName(dest)} is unavailable/locked`);return false;}
-    if(tr.cooldown?.is_on_cooldown){tradeNote(`Waiting for travel cooldown ${Math.ceil(Number(tr.cooldown.remaining_seconds||0)/60)}m`);return false;}
-    if(tr.jail?.isInJail || tr.hospital?.isInHospital){tradeNote('Travel is blocked by jail or hospital');return false;}
-    const fare=Number(city.travel_cost);
-    if(!Number.isFinite(fare)||fare<0){tradeNote('Destination fare not exposed; cannot assess net profit');return false;}
-    const cash=Math.max(0,Number(t.money||0)-Number(S.trading.keepCash||0)-fare);
-    const room=Math.max(0,Number(t.carry_capacity||0)-Number(t.inventory_weight||0));
-    const candidates=(Array.isArray(t.trade_routes)?t.trade_routes:[])
-      .filter(r=>r.type==='buy_here' && Number(r.buy_location_id)===here && Number(r.sell_location_id)===dest &&
-        r.buy_stock_indicator!=='empty' && Number(r.buy_price)>0 && Number(r.sell_price)>0)
-      .map(r=>{
-        const qty=Math.min(Math.floor(room),maxTx,Math.floor(cash/Number(r.buy_price)));
-        const net=qty*(Number(r.sell_price)-Number(r.buy_price))-fare;
-        const pct=100*(Number(r.sell_price)-Number(r.buy_price))/Number(r.buy_price);
-        return { ...r,qty,net,pct };
-      })
-      .filter(r=>r.qty>0 && r.net>=Number(S.trading.minNetProfit||1) && r.pct>=Number(S.trading.minProfitPct||0))
-      .sort((a,b)=>b.net-a.net);
-    if(!candidates.length){
-      const advertised=(Array.isArray(t.trade_routes)?t.trade_routes:[])
-        .filter(r=>r.type==='buy_here' && Number(r.buy_location_id)===here && Number(r.sell_location_id)===dest);
-      tradeNote(advertised.length
-        ? `No affordable/profitable ${tradingCityName(here)} → ${tradingCityName(dest)} load after ${money(fare)} fare; waiting for prices or space`
-        : `No quoted buy-and-sell route for ${tradingCityName(here)} → ${tradingCityName(dest)} in Drug Market offers; travel alone is not enough`);
+    if(tr.jail?.isInJail || tr.hospital?.isInHospital){tradeNote('Travel blocked by jail or hospital');return false;}
+    const secondsLeft=Math.max(0,Number(tr.cooldown?.remaining_seconds)||0);
+    const cooling=tr.cooldown?.is_on_cooldown===true || secondsLeft>0;
+    st.tradeTravelReadyAt=cooling?now()+Math.max(15,secondsLeft)*1000:0;
+    if(travelHold){
+      if(cooling){tradeNote('Previous travel still under cooldown; not resubmitting fare');return false;}
+      // Two minutes have passed, origin is still confirmed, and the server
+      // now reports no travel cooldown. Only then can a new leg be attempted.
+      setTradeTravelPending(null);
+    }
+    const plan=tradePlan();
+    const inspectionRisk=Math.max(0,Number(tr.contraband?.inspection_risk)||0);
+    const acceptableRisk=inspectionRisk<=Number(S.trading.maxRisk||0);
+    const validPlan=plan && acceptableRisk && Number(plan.sell_location_id)===dest &&
+      items.some(i=>Number(i.drug_id)===Number(plan.drug_id));
+    // Inventory can be sold while travel cools down. A newly bought, planned
+    // load for the opposite city is held, not sold back where it was bought.
+    const shouldSell=items.length>0 && S.trading.sellInventory && !validPlan && inventorySettled;
+    if(shouldSell && canTrade){
+      const sale=items.map(inv=>({inv,drug:tradePrice(t,inv.drug_id)}))
+        .filter(x=>x.drug && Number(x.drug.sell_price)>0)
+        .sort((a,b)=>Number(b.drug.sell_price)*Number(b.inv.quantity)-Number(a.drug.sell_price)*Number(a.inv.quantity))[0];
+      if(sale){
+        if(plan && Number(plan.drug_id)===Number(sale.inv.drug_id))setTradePlan(null);
+        return tradeRequest('sell',sale.drug,Math.min(maxTx,Math.floor(Number(sale.inv.quantity))),t);
+      }
+    }
+    if(cooling){
+      tradeNote(`Waiting ${Math.ceil(secondsLeft/60)}m for travel: ${tradingCityName(here)} → ${tradingCityName(dest)}`);
       return false;
     }
-    const best=candidates[0];
-    // User explicitly requested buying only immediately before travelling.
-    // Never pre-buy while travel is on cooldown.
-    setTradePlan({drug_id:Number(best.drug_id),sell_location_id:dest,buy_price:Number(best.buy_price),quantity:best.qty,net:best.net,at:now()});
-    const did=await tradeRequest('buy',{id:best.drug_id,name:best.drug_name},best.qty,t);
-    if(!did){setTradePlan(null);return false;}
-    tradeNote(`Bought ${best.qty} ${best.drug_name} for ${tradingCityName(dest)}; expected net ${money(best.net)} after fare`,'good');
+    const fare=Number(city.travel_cost);
+    if(!Number.isFinite(fare)||fare<0){tradeNote('Destination fare not verified; not spending blindly','warn');return false;}
+    const reserve=Number(S.trading.keepCash)||0;
+    const moneyAvailable=Number(t.money);
+    if(!Number.isFinite(moneyAvailable) || moneyAvailable<fare+reserve){
+      tradeNote(`Travel to ${tradingCityName(dest)} needs ${money(fare)} fare plus ${money(reserve)} reserve`,'warn');
+      return false;
+    }
+    // Only buy on a travel-ready tick, with space/cash after reserving fare.
+    // As travel happens anyway, the incremental cargo profit need not pay
+    // the fare a second time. Never buy on uncertain inventory data.
+    if(!items.length && inventorySettled && canTrade && acceptableRisk){
+      const freeCash=Math.max(0,moneyAvailable-reserve-fare);
+      const room=Math.max(0,Number(t.carry_capacity||0)-Number(t.inventory_weight||0));
+      const candidates=(Array.isArray(t.trade_routes)?t.trade_routes:[])
+        .filter(r=>r.type==='buy_here' && Number(r.buy_location_id)===here &&
+          Number(r.sell_location_id)===dest && r.buy_stock_indicator!=='empty' &&
+          Number(r.buy_price)>0 && Number(r.sell_price)>0)
+        .map(r=>{
+          const qty=Math.min(Math.floor(room),maxTx,Math.floor(freeCash/Number(r.buy_price)));
+          const gross=qty*(Number(r.sell_price)-Number(r.buy_price));
+          const net=S.trading.loopTravel?gross:gross-fare;
+          const pct=100*(Number(r.sell_price)-Number(r.buy_price))/Number(r.buy_price);
+          return {...r,qty,net,pct};
+        })
+        .filter(r=>r.qty>0 && r.net>=Number(S.trading.minNetProfit||1) &&
+          r.pct>=Number(S.trading.minProfitPct||0))
+        .sort((a,b)=>b.net-a.net);
+      if(candidates.length){
+        const best=candidates[0];
+        setTradePlan({drug_id:Number(best.drug_id),sell_location_id:dest,
+          buy_price:Number(best.buy_price),quantity:best.qty,net:best.net,at:now()});
+        const bought=await tradeRequest('buy',{id:best.drug_id,name:best.drug_name},best.qty,t);
+        if(bought){tradeNote(`Bought ${best.qty} ${best.drug_name} for ${tradingCityName(dest)}; cargo gain ${money(best.net)}`,'good');return true;}
+        setTradePlan(null);
+        // An uncertain purchase cannot be repeated, but it must not stop
+        // the user-requested city loop either.
+      }else if(!S.trading.loopTravel){
+        tradeNote(`No profitable cargo for ${tradingCityName(dest)}; waiting for prices`);
+        return false;
+      }
+    }else if(!S.trading.loopTravel && !validPlan){
+      tradeNote('Trading-only mode: waiting for cargo before travelling');return false;
+    }
+    // No viable drugs, trading cooldown, insufficient stock, or uncertain
+    // market request: still travel when the selected city is reachable.
+    const hold={from:here,to:dest,at:now()};
+    setTradeTravelPending(hold);
+    let reply;
+    try{reply=await POST(`/transit/${dest}`);}
+    catch(e){tradeNote(`Travel response uncertain; checking destination before retry: ${String(e.message||e).slice(0,90)}`,'warn');return false;}
+    if(reply?.success===false || reply?.error){
+      setTradeTravelPending(null);
+      tradeNote(`Travel rejected: ${reply.error||reply.message||'server declined'}`,'warn');return false;
+    }
+    st.lastCharAt=0;
+    st.lastTradeCheck=0;
+    st.tradeTravelReadyAt=now()+30000;
+    tradeNote(`Travelling ${tradingCityName(here)} → ${tradingCityName(dest)}${validPlan?' with a drug load':' (no load needed)'}`,'good');
     return true;
   }
 
@@ -3189,7 +3327,10 @@ async function garageApiSweep() {
       .sort(([a],[b])=>Number(metric(a).lastCheckAt||0)-Number(metric(b).lastCheckAt||0))[0];
     if(overdue)raise(overdue[0]);
     const tradingDue=S.modules.trading && at>=metric('trading').nextAllowed &&
-      (tradePlan() || tradePending() || at-Number(st.lastTradeCheck||0)>=120000);
+      (tradePlan() || tradePending() || tradeTravelPending() ||
+       (S.trading.loopTravel && tradingPair() &&
+        (!st.tradeTravelReadyAt || st.tradeTravelReadyAt<=at)) ||
+       at-Number(st.lastTradeCheck||0)>=120000);
     if(tradingDue)raise('trading');
     if(S.modules.smuggling && at-Number(st.lastSmuggleCheck||0)>=Number(S.smuggling.checkMinutes||5)*60000 &&
        at>=metric('smuggling').nextAllowed)raise('smuggling');
@@ -4432,7 +4573,7 @@ async function garageApiSweep() {
     } else if (tab === 'modules') {
       const groups=[
         ['Core activities', [['crimes','Crimes (including burglary)','Rotate through pickpocketing, car break-ins, shoplifting and burglary'],['gta','GTA','Steal cars using focus'],['heists','Heists','Spend wit on heists'],['gym','Gym','Train when energy is available'],['jailtime','Jail activities','Train and work while in jail']]],
-        ['Money and items', [['jobs','Jobs','Eligible criminal jobs'],['empire','Empire','Collect earnings'],['workshop','Workshop','Items first, selected drugs if nothing craftable'],['smuggling','Smuggling','Run profitable deliveries'],['garage','Garage','Protect cargo cars and crush local low-capacity cars'],['trading','Drug trading','Buy and sell at a profit']]],
+        ['Money and items', [['jobs','Jobs','Eligible criminal jobs'],['empire','Empire','Collect earnings'],['workshop','Workshop','Items first, selected drugs if nothing craftable'],['smuggling','Smuggling','Run profitable deliveries'],['garage','Garage','Protect cargo cars and crush local low-capacity cars'],['trading','Drug trading','Travel A ↔ B and trade profitable cargo']]],
         ['Rewards and special', [['dailies','Daily objectives','Claim finished rewards'],['missions','Missions','Claim completed missions'],['mobpass','MOB Pass','Claim earned pass rewards'],['bosses','Bosses','Fight eligible Mob bosses'],['oc','Organised crime','Join and contribute to OCs'],['busting','Jail busting','Help prisoners escape']]],
       ];
       bd.innerHTML=`<div class="simple-title">What should run?</div><div class="hint">Green means enabled. Activities wait for their own resources, cooldowns and eligibility.</div>`+
@@ -4454,7 +4595,7 @@ async function garageApiSweep() {
             <div><label class="f" for="mbx-easy-city-b">Second city</label><select id="mbx-easy-city-b"><option value="0">Choose city...</option>${TRADING_CITIES.map(c=>`<option value="${c.id}" ${S.trading.cityB===c.id?'selected':''}>${c.name}</option>`).join('')}</select></div>
           </div>
           <div class="hint" id="mbx-easy-trade-route" role="status" aria-live="polite"></div>
-          <div class="hint">Saved automatically. Trades only between these cities when prices cover the fare. This is Drug Market trading, not Supply Lines smuggling.</div>
+          <div class="hint">Saved automatically. Continuous travel alternates between these two cities even without profitable cargo, paying each fare if affordable. Turn it off in Advanced for profit-gated trips. This is Drug Market trading, not Supply Lines smuggling.</div>
         </div>
         <label class="f" for="mbx-easy-mode">Main objective</label>
         <select id="mbx-easy-mode"><option value="xp">Earn XP and rank up</option><option value="money">Make money</option><option value="balanced">Balance XP and money</option><option value="progression">Unlock new activities</option><option value="custom">My saved priority order</option></select>
@@ -4478,7 +4619,7 @@ async function garageApiSweep() {
         const a=Number(S.trading.cityA),b=Number(S.trading.cityB);
         const pair=a && b && a!==b;
         routeStatus.textContent=warning || (pair
-          ? `${tradingCityName(a)} ↔ ${tradingCityName(b)} · ${S.modules.trading?'Trading enabled':'Trading switched off'}`
+          ? `${tradingCityName(a)} ↔ ${tradingCityName(b)} · ${S.modules.trading?(S.trading.loopTravel?'Continuous travel enabled':'Profit-gated trading enabled'):'Trading switched off'}`
           : 'Choose two different cities to enable the trading loop.');
       }
       [cityA,cityB].forEach((select,index)=>{select.onchange=()=>{
@@ -4645,17 +4786,17 @@ async function garageApiSweep() {
           <div class="mini-note">Only acts on confirmed visible Garage rows. Cargo capacity 60+ is protected. Crushing is local to your current district; no travel for crushing. User locks are never removed.</div>
           <div class="tog"><span>Lock high-capacity cars automatically</span><div class="sw" data-b="garage.protect"></div></div>
           <div class="tog"><span>Crush unprotected local low-capacity cars</span><div class="sw" data-b="garage.crushLocal"></div></div>
-          <div class="tog"><span>Repair protected cars when price is known</span><div class="sw" data-b="garage.repair"></div></div>
+          <div class="tog"><span>Repair all damaged cars before crushing</span><div class="sw" data-b="garage.repair"></div></div>
           <div class="tog"><span>Capacity upgrades on visible Smuggling Upgrades tab</span><div class="sw" data-b="garage.upgradeCapacity"></div></div>
           <div class="tog"><span>Open GTA Garage automatically for checks</span><div class="sw" data-b="garage.navigateToGarage"></div></div>
           <div class="row2"><div><label class="f">Protect capacity from</label><input type="number" min="1" data-k="garage.minBaseCapacity"></div>
              <div><label class="f">Garage check interval (minutes)</label><input type="number" min="10" data-k="garage.checkMinutes"></div></div>
           <label class="f">Maximum total crusher fee ($)</label><input type="number" min="0" data-k="garage.maxCrushTotalFee">
-          <div class="mini-note">The bot scans every Garage page, protects high-capacity/locked/upgraded cars, and uses the captured crush-selected-cars request. Only cars in your current district can be crushed. Maximum fee per batch: $100,000 by default.</div>
+          <div class="mini-note">All damaged cars (including locked and high-capacity cars) must be repaired first, across every Garage page. If any car is busy, its damage or repair price is unknown, or repairs cannot be afforded, crushing waits. Only unprotected low-capacity cars in your current district are crushed using the ID-selective request.</div>
           <div class="row2"><div><label class="f">Max repair cost ($)</label><input type="number" min="0" data-k="garage.maxRepairCost"></div>
              <div><label class="f">Max capacity upgrade ($)</label><input type="number" min="0" data-k="garage.maxCapacityUpgradeCost"></div></div>
           <label class="f">Keep cash reserve ($)</label><input type="number" min="0" data-k="garage.keepCash">
-          <div class="mini-note">Repair and Door Panels upgrades require visible priced controls and a confirmed local car. Open GTA → Garage to protect/crush, or Drugs → Smuggling → Upgrades to upgrade. If the displayed page doesn't provide enough evidence, the bot will skip it. Hidden cars/pagination ambiguity block bulk crushing.</div>`),
+          <div class="mini-note">Repairs use the verified /garage/repair API and are checked against a fresh Garage snapshot. Maximum repair cost applies per car and the cash reserve is maintained. Door Panels upgrades still require visible priced controls. An uncertain repair result prevents another paid action until checked.</div>`),
         sec('drugs', 'Drugs, smuggling &amp; trading', `
           <div class="tog"><span>Craft affordable Items before drugs</span><div class="sw" data-b="workshop.itemsFirst"></div></div>
           <div class="tog"><span>Craft selected drugs when no item is affordable</span><div class="sw" data-b="workshop.drugsFallback"></div></div>
@@ -4677,17 +4818,18 @@ async function garageApiSweep() {
           <div class="row2"><div><label class="f">Minimum net profit ($)</label><input type="number" min="0" data-k="smuggling.minExpectedProfit"></div><div><label class="f">Reserve cash ($)</label><input type="number" min="0" data-k="smuggling.keepCash"></div></div>
           <div class="mini-note">Destination and drug change with live prices. The game preview confirms cost, estimated payout, success chance and duration before any paid launch; XP not exposed uses profit/hour as fallback.</div>
           <div class="tog"><span>Travel to finish smuggles</span><div class="sw" data-b="smuggling.autoTravelToComplete"></div></div>
-          <div class="mini-note">Choose your two trading cities directly on the main Options screen. Existing stock is sold locally; a new load is bought only when the selected paired route offers a verified net profit after travel fare and travel is available.</div>
+          <div class="tog"><span>Keep travelling A ↔ B even without profitable drugs</span><div class="sw" data-b="trading.loopTravel"></div></div>
+          <div class="mini-note">With this on, travel alternates between your two selected cities whenever the game permits, even with no drugs, and always pays the fare. Profitable cargo is optional; keep-cash, travel cooldown, locked destinations and jail/hospital still block travel. Switch off for profit-gated travel.</div>
           <div class="row2">
             <div><label class="f">Trade min profit %</label><input type="number" data-k="trading.minProfitPct"></div>
             <div><label class="f">Max police risk %</label><input type="number" data-k="trading.maxRisk"></div>
           </div>
           <div class="row2">
             <div><label class="f">Keep cash ($)</label><input type="number" min="0" data-k="trading.keepCash"></div>
-            <div><label class="f">Minimum net profit after fare ($)</label><input type="number" min="1" data-k="trading.minNetProfit"></div>
+            <div><label class="f">Minimum cargo profit ($)</label><input type="number" min="1" data-k="trading.minNetProfit"></div>
           </div>
           <div class="tog"><span>Sell all held drugs at the current market</span><div class="sw" data-b="trading.sellInventory"></div></div>
-          <div class="mini-note">Crafted, rewarded and manually held drugs are sold locally at the game's current sell price. Stock is held only briefly after a planned purchase while travelling between the two selected cities. Ordinary sales can be below their historic acquisition cost.</div>`),
+          <div class="mini-note">Crafted, rewarded and manually held drugs are sold locally when the market allows. Planned trading cargo is held for its destination. Continuous travel may lose money on fares when no profitable cargo is available; the keep-cash reserve still applies.</div>`),
         sec('oc', 'Organised crime &amp; bosses', `
           <label class="f">Roles to join (tap to toggle, in order)</label>
           <div class="chips" id="mbx-ocroles">${[4, 2, 3, 5].map((r) => `<div class="chip ${S.oc.roles.includes(r) ? 'on' : ''}" data-ocrole="${r}">${{ 4: 'Driver', 2: 'Weapons', 3: 'Explosives', 5: 'Hacker' }[r]}</div>`).join('')}</div>
