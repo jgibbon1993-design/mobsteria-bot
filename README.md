@@ -1,6 +1,8 @@
 # Mobsteria Bot — stable Tampermonkey releases
 
-Latest stable: **v2.3.16**.
+Latest stable: **v2.3.18**.
+
+**v2.3.18:** Bidirectional trading travel between the configured cities (default Silverton ↔ The Docks); may travel without profitable cargo, with fare and cooldown safeguards. Keeps the v2.3.17 garage repair-before-crushing workflow. Offline tested; verify behaviour on a live account before relying on unattended operation.
 
 ## Install or update once
 
