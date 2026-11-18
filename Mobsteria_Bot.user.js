@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.27
+// @version      2.3.28
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3404,11 +3404,41 @@ async function garageApiSweep() {
   }
 
   // Burglary is now part of the single Crimes slot (not a separate module).
-  async function doCrimeGroup() {
+  async function doCrimeGroupOne() {
     if (S.crimes.mixEnabled && S.modules.burglary && preferredCrimeType()==='burglary') {
       if (await doBurglary()) return true;
     }
     return doCrimes();
+  }
+  async function doCrimeGroup() {
+    // Complete a modest sequential nerve-spend burst; never issue concurrent
+    // crime requests or reuse old nerve/target data. Honour configured delays,
+    // resource floors, server rate limits and challenge/jail/health guards.
+    const maxAttempts=5;
+    const started=now();
+    let completed=0;
+    for(let i=0;i<maxAttempts;i++){
+      if(!S.running||st.challenge||isJailed()||isHospital()||
+         (S.modules.oc&&['active','planning'].includes(st.ocPhase)&&i>0))break;
+      if(i>0){
+        const min=Math.max(1500,Number(S.delays.min)||2500);
+        const max=Math.max(min,Number(S.delays.max)||6000);
+        await sleep(rand(min,max));
+        await refreshChar(true);
+        if(now()-started>35000||!S.running||st.challenge||isJailed()||
+           isHospital()||cur('nerve')<=Math.max(num(S.crimes.keepNerve),resourceFloor('nerve')))break;
+      }
+      const acted=await doCrimeGroupOne();
+      if(!acted)break;
+      completed++;
+    }
+    if(completed>1){
+      // Scheduler counts one successful turn; account for extra actions in the burst.
+      st.stats.actions+=completed-1;
+      telemetryDirty=true;
+      log('Crimes: completed '+completed+' sequential actions in one nerve-spend burst','good');
+    }
+    return completed>0;
   }
 
   const MODULE_ORDER = [
