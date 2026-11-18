@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.26
+// @version      2.3.27
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -96,7 +96,7 @@
       drugsFallback: true, navigateToItems: true, maxItemCost: 25000, keepCash: 50000 },
     smuggling: { minLoad: 20, autoTravelToComplete: true, minExpectedProfit: 1, keepCash: 50000, checkMinutes: 5, allowedDrugs: [...DRUG_LIST] },
     // Garage uses visible game controls only: no guessed garage endpoints.
-    // Keep 60+ base cargo cars for smuggling. Never unlock cars automatically.
+    // Only auto-lock 60+ base cargo cars. Smaller cars remain available unlocked.
     garage: { minBaseCapacity: 60, checkMinutes: 45, maxCrushTotalFee: 100000,
       protect: true, crushLocal: true, repair: true, upgradeCapacity: true, shipAfterCrushToA: true,
       navigateToGarage: true, maxRepairCost: 25000,
@@ -1839,23 +1839,15 @@ async function garageApiSweep() {
     return true;
   }
   const local=cars.filter(c=>c.city===home);
-  // Reserve a working car for smuggling if no already-locked eligible local car exists.
-  if(S.modules.smuggling && S.garage.protect){
-    const hasProtected=local.some(c=>c.locked&&!c.busy&&!c.moving&&c.listing?.is_available===true);
-    if(!hasProtected){
-      const reserve=local.filter(c=>!c.locked&&!c.busy&&!c.moving&&
-        c.cap>=num(S.smuggling.minLoad)&&c.listing?.is_available===true)
-        .sort((a,b)=>b.cap-a.cap)[0];
-      if(reserve){
-        garageHold('lock',String(reserve.id),{phase:'api-pending',at:now()});
-        const reply=await POST('/garage/lock/'+reserve.id);
-        if(!/success|updated/i.test(String(reply?.message||''))){garageWarn('Smuggling reserve lock unconfirmed');return false;}
-        st.garageHold=null;GM_setValue(GARAGE_HOLD_KEY,'null');
-        st.lastGarageCheck=0;
-        garageWarn('Kept car '+reserve.id+' (capacity '+reserve.cap+') for smuggling');return true;
-      }
-    }
-  }
+  // Only 60+ capacity vehicles are automatically locked by the global pass.
+  // A smaller vehicle can still smuggle without a lock; if no eligible 60+
+  // local vehicle exists, keep one smaller usable option out of the crusher.
+  const smugglingLoad=Math.max(1,Number(S.smuggling.minLoad)||1);
+  const usableLocal=local.filter(c=>!c.moving&&!c.busy&&c.listing?.is_available===true);
+  const hasLargeSmugglingCar=usableLocal.some(c=>c.cap>=min);
+  const fallbackSmallCar=S.modules.smuggling&&!hasLargeSmugglingCar
+    ? usableLocal.filter(c=>c.cap<min&&c.cap>=smugglingLoad)
+        .sort((a,b)=>b.cap-a.cap)[0] : null;
   // V2.3.17: Repair EVERY damaged garage car before crushing ANY car.
   // The captured GTA2 game bundle verifies POST /garage/repair with
   // {carIds:[...]} and provides damage_percentage and repair_cost. Check
@@ -1924,7 +1916,8 @@ async function garageApiSweep() {
   // A below-threshold car with unknown upgrades or an unavailable/busy
   // smuggling state is not safe to destroy merely to free capacity.
   const selected=local.filter(c=>!c.locked&&!c.moving&&!c.busy&&!c.upgraded&&
-    c.cap<min && (!c.listing || c.listing.is_available===true));
+    c.id!==fallbackSmallCar?.id && c.cap<min &&
+    (!c.listing || c.listing.is_available===true));
   // HAR 2026-11-18 verifies POST /garage/bulk-ship with
   // {carIds:[...],destinationId:<game_locations.id>}, returning shipped_cars.
   // Ship only after no eligible local cars remain to crush. Never ship busy
@@ -4748,7 +4741,7 @@ async function garageApiSweep() {
     } else if (tab === 'modules') {
       const groups=[
         ['Core activities', [['crimes','Crimes (including burglary)','Rotate through pickpocketing, car break-ins, shoplifting and burglary'],['gta','GTA','Steal cars using focus'],['heists','Heists','Spend wit on heists'],['gym','Gym','Train when energy is available'],['jailtime','Jail activities','Train and work while in jail'],['bullets','Auto-buy bullets','Buy the biggest available pack when cash exceeds your threshold; respect factory cooldowns']]],
-        ['Money and items', [['jobs','Jobs','Eligible criminal jobs'],['empire','Empire','Collect earnings'],['workshop','Workshop','Items first, selected drugs if nothing craftable'],['smuggling','Smuggling','Run profitable deliveries'],['garage','Garage','Protect cargo cars and crush local low-capacity cars'],['trading','Drug trading','Travel A ↔ B and trade profitable cargo']]],
+        ['Money and items', [['jobs','Jobs','Eligible criminal jobs'],['empire','Empire','Collect earnings'],['workshop','Workshop','Items first, selected drugs if nothing craftable'],['smuggling','Smuggling','Run profitable deliveries'],['garage','Garage','Lock only 60+ cargo cars, preserve smaller smuggling fallback'],['trading','Drug trading','Travel A ↔ B and trade profitable cargo']]],
         ['Rewards and special', [['dailies','Daily objectives','Claim finished rewards'],['missions','Missions','Claim completed missions'],['mobpass','MOB Pass','Claim earned pass rewards'],['bosses','Bosses','Fight eligible Mob bosses'],['oc','Organised crime','Join and contribute to OCs'],['busting','Jail busting','Help prisoners escape']]],
       ];
       bd.innerHTML=`<div class="simple-title">What should run?</div><div class="hint">Green means enabled. Activities wait for their own resources, cooldowns and eligibility.</div>`+
@@ -4783,7 +4776,7 @@ async function garageApiSweep() {
         <label class="settings-toggle"><span>Regenerate high, then spend nerve/focus in batches (keep OC wit)</span><input type="checkbox" data-easy="scheduler.batchResources"></label>
         <label class="settings-toggle"><span>Rotate through all crime types</span><input type="checkbox" data-easy="crimes.mixEnabled"></label>
         <label class="settings-toggle"><span>Workshop: craft items before drugs</span><input type="checkbox" data-easy="workshop.itemsFirst"></label>
-        <label class="settings-toggle"><span>Protect cars with 60+ cargo capacity</span><input type="checkbox" data-easy="garage.protect"></label>
+        <label class="settings-toggle"><span>Auto-lock cars with 60+ cargo capacity only</span><input type="checkbox" data-easy="garage.protect"></label>
         <label class="f" for="mbx-easy-bullets-threshold">Auto-buy bullet cash threshold ($) — switch under Core activities</label>
         <input id="mbx-easy-bullets-threshold" type="number" min="0" step="10000" value="${S.bullets.minCash}">
         <div class="mini-note">Default $1,000,000. Buy only when current cash exceeds this amount; the biggest affordable pack is selected. Two purchases are allowed before the factory's cooldown. Other bot activities continue between checks.</div>
