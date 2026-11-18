@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.20
+// @version      2.3.21
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -1580,7 +1580,7 @@
     if(!hold)return false;
     // A bulk crush or paid repair/upgrade must not be repeated blindly after
     // refresh or a network delay. Let the user inspect ambiguous results.
-    const ms=hold.kind==='crush'||hold.kind==='repair'||hold.kind==='upgrade'?10*60000:60000;
+    const ms=['crush','repair','upgrade','ship'].includes(hold.kind)?10*60000:60000;
     if(now()-num(hold.at)<ms)return true;
     st.garageHold=null;GM_setValue(GARAGE_HOLD_KEY,'null');return false;
   }
@@ -1915,17 +1915,50 @@ async function garageApiSweep() {
   // smuggling state is not safe to destroy merely to free capacity.
   const selected=local.filter(c=>!c.locked&&!c.moving&&!c.busy&&!c.upgraded&&
     c.cap<min && (!c.listing || c.listing.is_available===true));
-  // Keep shipping after crushing, and tie destination to Trading City A.
-  // Do not guess an undocumented shipping API or payload.
+  // HAR 2026-11-18 verifies POST /garage/bulk-ship with
+  // {carIds:[...],destinationId:<game_locations.id>}, returning shipped_cars.
+  // Ship only after no eligible local cars remain to crush. Never ship busy
+  // cars, cars in transit, or cars already at the configured Trading City A.
   if(selected.length===0 && S.garage.shipAfterCrushToA){
     const target=TRADING_CITIES.find(c=>c.id===Number(S.trading.cityA));
-    const destination=target&&garageApiLocation(target.name);
-    const remaining=cars.filter(c=>!c.moving&&!c.busy&&c.city!==destination);
-    const processing=rows.some(raw=>/crush|queue|processing/i.test(String(raw.status||raw.crusher_status||'')));
-    if(target&&remaining.length&&!processing){
-      garageWarn('Crushing complete; '+remaining.length+' remaining eligible cars should ship to City A ('+
-        target.name+'). Shipping request not yet verified; no unconfirmed shipment submitted');
+    const listed=(first.game_locations||[]).find(c=>
+      Number(c?.id)===Number(target?.id)&&
+      garageApiLocation(c?.name)===garageApiLocation(target?.name));
+    if(!target||!listed){
+      garageWarn('Location A not verified against game locations; shipping skipped');
       return false;
+    }
+    const destination=garageApiLocation(target.name);
+    const processing=rows.some(raw=>/crush|queue|processing/i.test(
+      String(raw.status||raw.crusher_status||'')));
+    if(processing){
+      garageWarn('Crusher still processing cars; shipping deferred');
+      return false;
+    }
+    const remaining=cars.filter(c=>!c.moving&&!c.busy&&c.city!==destination);
+    if(remaining.length){
+      const ids=remaining.slice(0,10).map(c=>c.id);
+      garageHold('ship',ids.join(','),{phase:'api-pending',ids,
+        destinationId:target.id,destination,at:now()});
+      const reply=await POST('/garage/bulk-ship',{carIds:ids,destinationId:target.id});
+      const shipped=Array.isArray(reply?.shipped_cars)?
+        reply.shipped_cars.map(c=>garageId(c?.id)):[];
+      if(ids.some(id=>!shipped.includes(id))){
+        garageWarn('Shipping response incomplete; no blind retry for '+ids.length+' cars');
+        return false;
+      }
+      const after=await garageApiInventory();
+      const byId=new Map(after.rows.map(c=>[garageId(c?.id),c]));
+      if(!ids.every(id=>byId.has(id)&&
+          garageApiLocation(byId.get(id).location)===destination)){
+        garageWarn('Shipping submitted but destination not verified; waiting for recheck');
+        return false;
+      }
+      st.garageHold=null;GM_setValue(GARAGE_HOLD_KEY,'null');
+      st.lastGarageCheck=0;
+      garageWarn('Verified shipping '+ids.length+' remaining cars to City A ('+
+        target.name+'); '+Math.max(0,remaining.length-ids.length)+' more eligible cars');
+      return true;
     }
   }
   const fee=Number(first?.crusher?.price_per_car);
@@ -1959,6 +1992,26 @@ async function garageApiSweep() {
 }
 
   async function doGarage() {
+    // Shipping has a persistent request hold. After any error or reload,
+    // verify the IDs' locations before resuming, never resubmit blindly.
+    if(st.garageHold?.kind==='ship'&&st.garageHold?.phase==='api-pending'){
+      const hold=st.garageHold;
+      if(now()-num(st.lastShipRecheckAt)<120000)return false;
+      st.lastShipRecheckAt=now();
+      try {
+        const after=await garageApiInventory();
+        const byId=new Map(after.rows.map(c=>[garageId(c?.id),c]));
+        if(Array.isArray(hold.ids)&&hold.ids.length&&hold.ids.every(id=>
+          byId.has(id)&&garageApiLocation(byId.get(id).location)===hold.destination)){
+          st.garageHold=null;GM_setValue(GARAGE_HOLD_KEY,'null');
+          st.lastGarageCheck=0;
+          garageWarn('Verified previously pending shipment to '+hold.destination);
+          return true;
+        }
+        garageWarn('Shipping result unresolved; will not repeat shipment blindly');
+      }catch(err){garageWarn('Shipping verification failed: '+String(err?.message||err));}
+      return false;
+    }
     // An uncertain paid repair is never submitted twice, even after the
     // usual 10-minute garage hold expires. Re-check the authoritative Garage
     // inventory for the same IDs and resume only after every one reads 0%.
@@ -4819,7 +4872,7 @@ async function garageApiSweep() {
         sec('garage', 'Garage and smuggling cars', `
           <div class="mini-note">Only acts on confirmed visible Garage rows. Cargo capacity 60+ is protected. Crushing is local to your current district; no travel for crushing. User locks are never removed.</div>
           <div class="tog"><span>Lock high-capacity cars automatically</span><div class="sw" data-b="garage.protect"></div></div>
-          <div class="tog"><span>Ship remaining cars to trading City A after crushing (requires verified shipping action)</span><div class="sw" data-b="garage.shipAfterCrushToA"></div></div>
+          <div class="tog"><span>Ship remaining eligible cars to trading City A after crushing</span><div class="sw" data-b="garage.shipAfterCrushToA"></div></div>
           <div class="tog"><span>Crush unprotected local low-capacity cars</span><div class="sw" data-b="garage.crushLocal"></div></div>
           <div class="tog"><span>Repair all damaged cars before crushing</span><div class="sw" data-b="garage.repair"></div></div>
           <div class="tog"><span>Capacity upgrades on visible Smuggling Upgrades tab</span><div class="sw" data-b="garage.upgradeCapacity"></div></div>
