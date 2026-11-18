@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.24
+// @version      2.3.25
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -4747,7 +4747,7 @@ async function garageApiSweep() {
       renderStatus();renderStats();
     } else if (tab === 'modules') {
       const groups=[
-        ['Core activities', [['crimes','Crimes (including burglary)','Rotate through pickpocketing, car break-ins, shoplifting and burglary'],['gta','GTA','Steal cars using focus'],['heists','Heists','Spend wit on heists'],['gym','Gym','Train when energy is available'],['jailtime','Jail activities','Train and work while in jail']]],
+        ['Core activities', [['crimes','Crimes (including burglary)','Rotate through pickpocketing, car break-ins, shoplifting and burglary'],['gta','GTA','Steal cars using focus'],['heists','Heists','Spend wit on heists'],['gym','Gym','Train when energy is available'],['jailtime','Jail activities','Train and work while in jail'],['bullets','Auto-buy bullets','Buy the biggest available pack when cash exceeds your threshold; respect factory cooldowns']]],
         ['Money and items', [['jobs','Jobs','Eligible criminal jobs'],['empire','Empire','Collect earnings'],['workshop','Workshop','Items first, selected drugs if nothing craftable'],['smuggling','Smuggling','Run profitable deliveries'],['garage','Garage','Protect cargo cars and crush local low-capacity cars'],['trading','Drug trading','Travel A ↔ B and trade profitable cargo']]],
         ['Rewards and special', [['dailies','Daily objectives','Claim finished rewards'],['missions','Missions','Claim completed missions'],['mobpass','MOB Pass','Claim earned pass rewards'],['bosses','Bosses','Fight eligible Mob bosses'],['oc','Organised crime','Join and contribute to OCs'],['busting','Jail busting','Help prisoners escape']]],
       ];
@@ -4784,8 +4784,7 @@ async function garageApiSweep() {
         <label class="settings-toggle"><span>Rotate through all crime types</span><input type="checkbox" data-easy="crimes.mixEnabled"></label>
         <label class="settings-toggle"><span>Workshop: craft items before drugs</span><input type="checkbox" data-easy="workshop.itemsFirst"></label>
         <label class="settings-toggle"><span>Protect cars with 60+ cargo capacity</span><input type="checkbox" data-easy="garage.protect"></label>
-        <label class="settings-toggle"><span>Auto-buy biggest available bullet boxes</span><input type="checkbox" data-easy="modules.bullets"></label>
-        <label class="f" for="mbx-easy-bullets-threshold">Buy bullets when cash exceeds ($)</label>
+        <label class="f" for="mbx-easy-bullets-threshold">Auto-buy bullet cash threshold ($) — switch under Core activities</label>
         <input id="mbx-easy-bullets-threshold" type="number" min="0" step="10000" value="${S.bullets.minCash}">
         <div class="mini-note">Default $1,000,000. Buy only when current cash exceeds this amount; the biggest affordable pack is selected. Two purchases are allowed before the factory's cooldown. Other bot activities continue between checks.</div>
         <label class="settings-toggle"><span>Crush low-capacity cars in current district</span><input type="checkbox" data-easy="garage.crushLocal"></label>
