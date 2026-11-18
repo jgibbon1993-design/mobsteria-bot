@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.28
+// @version      2.3.29
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -544,6 +544,8 @@
     if(key==='oc' && st.ocPhase==='active') return 5000;
     if(key==='oc' && st.ocPhase==='planning') return 45000;
     if(key==='empire')return Math.max(120000,Number(S.empire.checkMinutes||15)*60000);
+    // Check for newly freed workshop queue space without delaying other modules.
+    if(key==='workshop')return 30000;
     if(key==='trading'){
       if(tradePlan()||tradePending()||tradeTravelPending())return 25000;
       if(tradingPair() && S.trading.loopTravel){
@@ -1429,19 +1431,25 @@
     st.lastWorkshopUiStep=now();control.click();st.lastWorkshopCheck=0;
     log(`Workshop: inspecting ${item.name} before queuing`,'info');return true;
   }
+  function workshopQueueNewIds(pending, lab){
+    if(!pending || !Array.isArray(pending.queuedBefore))return false;
+    const old=new Set(pending.queuedBefore.map(String));
+    return (lab?.queue?.items||[]).some(x=>x?.id!=null&&!old.has(String(x.id)));
+  }
   function workshopItemEnqueued(pending, lab){
     if(!pending || pending.kind!=='item')return false;
     const old=new Set((pending.queuedBefore||[]).map(String));
     return (lab?.queue?.items||[]).some(x=>String(x.name||'')===pending.name && x.id!=null && !old.has(String(x.id)));
   }
-  async function doWorkshop() {
+  async function doWorkshopSingle() {
     if(now()-st.lastWorkshopCheck<20000)return false;
     st.lastWorkshopCheck=now();
     const lab=await GET('/lab');
     const queue=lab.queue||{};
     const pending=st.workshopPending;
     if(pending){
-      if(pending.kind==='item' && workshopItemEnqueued(pending,lab)){
+      if((pending.kind==='item' && workshopItemEnqueued(pending,lab)) ||
+         (pending.kind==='drug' && workshopQueueNewIds(pending,lab))){
         st.stats.crafts++;log(`Workshop: queued item ${pending.name} confirmed after reload`,'good');
         st.workshopPending=null;GM_setValue(WORKSHOP_PENDING_KEY,'null');
       }else{
@@ -1453,6 +1461,13 @@
         st.workshopPending=null;GM_setValue(WORKSHOP_PENDING_KEY,'null');
         workshopWarn(`previous ${pending.kind==='item'?'item':'drug'} enqueue hold expired; outcome unknown`);
       }
+    }
+    const durationLimit=Number(queue.max_queue_duration);
+    const waiting=Number(queue.queue_wait_seconds);
+    if(queue.is_full===true || (Number.isFinite(durationLimit) &&
+       Number.isFinite(waiting) && durationLimit>0 && waiting>=durationLimit)){
+      workshopWarn('Queue full; checking again when space becomes available');
+      return false;
     }
     if(S.workshop.itemsFirst){
       const list=Object.values(lab.craftable_items||{}).filter(x=>workshopItemEligible(x,lab))
@@ -1506,7 +1521,8 @@
       const tier=[...(e.tiers||[])].reverse().find(t=>t.can_afford);
       if(tier)enhancer={item_id:e.item_id,quantity:tier.quantity_required};
     }
-    st.workshopPending={at:now(),kind:'drug',name:String(drug.name||'craft').slice(0,80)};
+    st.workshopPending={at:now(),kind:'drug',name:String(drug.name||'craft').slice(0,80),
+      queuedBefore:workshopQueueIds(lab)};
     GM_setValue(WORKSHOP_PENDING_KEY,JSON.stringify(st.workshopPending));
     let response;
     try {response=await POST('/lab/craft-drug',{item_id:drug.id,enhancer});}
@@ -1520,10 +1536,57 @@
       st.workshopPending=null;GM_setValue(WORKSHOP_PENDING_KEY,'null');
       log(`Workshop: ${drug.name} enqueue rejected; no craft counted`,'warn');return false;
     }
+    // Only continue a bulk fill when the submitted drug is confirmed in the queue.
+    const confirmed=Boolean(response?.success===true &&
+      (response?.queue_item?.id!=null ||
+       workshopQueueNewIds(st.workshopPending,{queue:response?.queue})));
+    if(!confirmed){
+      try{
+        const updated=await GET('/lab');
+        if(workshopQueueNewIds(st.workshopPending,updated)){
+          st.workshopPending=null;
+          GM_setValue(WORKSHOP_PENDING_KEY,'null');
+        }
+      }catch{/* Leave the pending hold for next check. */}
+    }else{
+      st.workshopPending=null;
+      GM_setValue(WORKSHOP_PENDING_KEY,'null');
+    }
     st.stats.crafts++;
     log(`Workshop: queued fallback drug ${drug.name}${enhancer?' (enhanced)':''}; finished result unconfirmed`,'good');
     st.lastWorkshopCheck=0;
     return true;
+  }
+
+  async function doWorkshop() {
+    // Fill the verified queue in a single scheduled turn. Each action is
+    // sequential, followed by a fresh lab snapshot in doWorkshopSingle().
+    // Stop on full queue, unconfirmed response, missing resources, or errors.
+    // Other modules continue to run normally after this short bounded burst.
+    let completed=0;
+    const start=now();
+    for(let n=0;n<12 && now()-start<60000;n++){
+      if(!S.running||st.challenge||isJailed()||isHospital()||
+         (n>0 && S.modules.oc && ['active','planning'].includes(st.ocPhase)))break;
+      if(n>0){
+        const low=Math.max(1500,Number(S.delays.min)||2500);
+        const high=Math.max(low,Number(S.delays.max)||6000);
+        await sleep(rand(low,high));
+        await refreshChar(true);
+        st.lastWorkshopCheck=0;
+        if(!S.running||st.challenge||isJailed()||isHospital())break;
+      }
+      const done=await doWorkshopSingle();
+      if(!done)break;
+      completed++;
+      if(st.workshopPending)break; // Never submit a second craft after ambiguity.
+    }
+    if(completed>1){
+      st.stats.actions+=completed-1;
+      telemetryDirty=true;
+      log('Workshop: filled '+completed+' queue slots in one pass','good');
+    }
+    return completed>0;
   }
 
   // ---- Garage: conservative, low-frequency local vehicle management.
