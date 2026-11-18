@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.22
+// @version      2.3.23
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -212,6 +212,8 @@
     S.pacing=deepMerge(DEFAULTS.pacing,S.pacing||{});
     S.smuggling=deepMerge(DEFAULTS.smuggling,S.smuggling||{});
     S.trading=deepMerge(DEFAULTS.trading,S.trading||{});
+    S.bullets=deepMerge(DEFAULTS.bullets,S.bullets||{});
+    S.bullets.minCash=Math.max(0,Math.floor(Number(S.bullets.minCash)||0));
     for(const k of ['cityA','cityB']){const id=Number(S.trading[k])||0;S.trading[k]=TRADING_CITIES.some(c=>c.id===id)?id:0;}
     S.trading.loopTravel=S.trading.loopTravel!==false;
     S.trading.minProfitPct=Math.max(0,Math.min(1000,Number(S.trading.minProfitPct)||0));
@@ -1999,7 +2001,7 @@ async function garageApiSweep() {
   async function doBullets() {
     if(!S.modules.bullets)return false;
     if(now()<num(st.nextBulletCheckAt||0))return false;
-    const minCash=Math.max(1000000,Number(S.bullets?.minCash)||1000000);
+    const minCash=Math.max(0,Number(S.bullets?.minCash)??1000000);
     const cash=Number(st.char?.money);
     if(!Number.isFinite(cash)||cash<=minCash){
       st.nextBulletCheckAt=now()+30000;
@@ -4775,7 +4777,10 @@ async function garageApiSweep() {
         <label class="settings-toggle"><span>Rotate through all crime types</span><input type="checkbox" data-easy="crimes.mixEnabled"></label>
         <label class="settings-toggle"><span>Workshop: craft items before drugs</span><input type="checkbox" data-easy="workshop.itemsFirst"></label>
         <label class="settings-toggle"><span>Protect cars with 60+ cargo capacity</span><input type="checkbox" data-easy="garage.protect"></label>
-        <label class="settings-toggle"><span>Auto-buy biggest bullet boxes above 1,000,000 cash</span><input type="checkbox" data-easy="modules.bullets"></label>
+        <label class="settings-toggle"><span>Auto-buy biggest available bullet boxes</span><input type="checkbox" data-easy="modules.bullets"></label>
+        <label class="f" for="mbx-easy-bullets-threshold">Buy bullets when cash exceeds ($)</label>
+        <input id="mbx-easy-bullets-threshold" type="number" min="0" step="10000" value="${S.bullets.minCash}">
+        <div class="mini-note">Default $1,000,000. Buy only when current cash exceeds this amount; the biggest affordable pack is selected. Two purchases are allowed before the factory's cooldown. Other bot activities continue between checks.</div>
         <label class="settings-toggle"><span>Crush low-capacity cars in current district</span><input type="checkbox" data-easy="garage.crushLocal"></label>
         <div class="action-row"><button class="soft-btn" id="mbx-advanced">Advanced controls</button><button class="soft-btn" id="mbx-export-easy">Export diagnostics</button></div>
         <details class="guide"><summary>How does idle waiting work?</summary><p>When nothing is ready, the bot can sleep up to 30 minutes. It still checks earlier for game-specific cooldowns, near-full Empire income, OC actions and predicted resource readiness. A successful action continues after the normal short action gap; server rate limits remain authoritative.</p></details>
@@ -4812,9 +4817,26 @@ async function garageApiSweep() {
       const idle=bd.querySelector('#mbx-easy-check');idle.value=String(S.scheduler.idleCadenceSeconds);
       if(!idle.value || idle.selectedIndex<0)idle.value='1800';
       idle.onchange=e=>{S.scheduler.idleCadenceSeconds=Number(e.target.value);save();st.nextAction=0;};
+      const bulletThreshold=bd.querySelector('#mbx-easy-bullets-threshold');
+      if(bulletThreshold){
+        bulletThreshold.value=String(S.bullets.minCash);
+        bulletThreshold.onchange=()=>{
+          const value=Number(bulletThreshold.value);
+          if(!Number.isFinite(value)||value<0){
+            bulletThreshold.value=String(S.bullets.minCash);
+            return;
+          }
+          S.bullets.minCash=Math.floor(value);
+          bulletThreshold.value=String(S.bullets.minCash);
+          st.nextBulletCheckAt=0;
+          metric('bullets').nextAllowed=0;
+          st.nextAction=0;
+          save();
+        };
+      }
       bd.querySelectorAll('[data-easy]').forEach(x=>{
         const path=x.dataset.easy;const keys=path.split('.');const last=keys.pop();const parent=keys.reduce((o,k)=>o[k],S);
-        x.checked=!!parent[last];x.onchange=()=>{parent[last]=x.checked;st.resourceCycles={nerve:false,focus:false,wit:false};st.resourceTargets={};save();};
+        x.checked=!!parent[last];x.onchange=()=>{parent[last]=x.checked;if(path==='modules.bullets'){st.nextBulletCheckAt=0;metric('bullets').nextAllowed=0;st.nextAction=0;}st.resourceCycles={nerve:false,focus:false,wit:false};st.resourceTargets={};save();};
       });
       bd.querySelector('#mbx-advanced').onclick=()=>{S.panel.tab='advanced';save();renderBody();};
       bd.querySelector('#mbx-export-easy').onclick=exportDiagnostics;
