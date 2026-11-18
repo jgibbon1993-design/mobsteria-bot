@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.23
+// @version      2.3.24
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -126,7 +126,7 @@
       mode: 'balanced', // balanced | xp | money | progression | custom
       singleTab: true, // Prevent duplicate action loops in the same browser profile
       emptyBackoffMs: 5000,
-      idleCadenceSeconds: 1800, // 30-minute ceiling; earlier resource/module deadlines still win.
+      idleCadenceSeconds: 120, // 2-minute default ceiling; resource/module deadlines still win.
       errorBackoffMs: 30000,
       maxErrorBackoffMs: 180000,
       customOrder: [],
@@ -201,7 +201,14 @@
     s.alternateResources = s.alternateResources !== false;
   }
   normaliseResourceSettings();
-  S.scheduler.idleCadenceSeconds = Math.max(20,Math.min(1800,Number(S.scheduler.idleCadenceSeconds)||1800));
+  // Migrate the removed 30-minute choice to the new 2-minute default,
+  // retaining existing 30s, 1m, 2m and 5m preferences.
+  if(!GM_getValue('mbx_v2324_idle_migrated',false)){
+    if(Number(S.scheduler.idleCadenceSeconds)===1800)S.scheduler.idleCadenceSeconds=120;
+    GM_setValue(STORE_KEY,JSON.stringify(S));
+    GM_setValue('mbx_v2324_idle_migrated',true);
+  }
+  S.scheduler.idleCadenceSeconds=Math.max(20,Math.min(300,Number(S.scheduler.idleCadenceSeconds)||120));
   if (!GM_getValue('mbx_v230_ui_initialised',false)) { S.panel.tab='home'; S.running=false; GM_setValue(STORE_KEY,JSON.stringify(S)); GM_setValue('mbx_v230_ui_initialised',true); }
   if (!['home','modules','options','log','strategy','settings','health','advanced'].includes(S.panel.tab))S.panel.tab='home';
   function normalizeResearchOptions() {
@@ -313,17 +320,17 @@
   }
   // Keep established custom settings. Migrate only the old v2.3.10 defaults
   // so upgrading an existing account actually applies the requested 90/10
-  // batch policy and 30-minute idle ceiling.
+  // batch policy and legacy idle settings.
   if(!GM_getValue('mbx_v2311_resource_idle_migrated',false)){
     const sch=S.scheduler;
     for(const [key,oldValue,newValue] of [
       ['nerveStartPct',80,90],['nerveStopPct',15,10],
       ['focusStartPct',80,90],['focusStopPct',15,10],
-      ['idleCadenceSeconds',60,1800]]){
+      ['idleCadenceSeconds',60,120]]){
       if(Number(sch[key])===oldValue)sch[key]=newValue;
     }
     normaliseResourceSettings();
-    sch.idleCadenceSeconds=Math.max(20,Math.min(1800,Number(sch.idleCadenceSeconds)||1800));
+    sch.idleCadenceSeconds=Math.max(20,Math.min(300,Number(sch.idleCadenceSeconds)||120));
     S.running=false; // Review before resuming paid and destructive modules.
     GM_setValue(STORE_KEY,JSON.stringify(S));
     GM_setValue('mbx_v2311_resource_idle_migrated',true);
@@ -4768,8 +4775,8 @@ async function garageApiSweep() {
         <label class="f" for="mbx-easy-mode">Main objective</label>
         <select id="mbx-easy-mode"><option value="xp">Earn XP and rank up</option><option value="money">Make money</option><option value="balanced">Balance XP and money</option><option value="progression">Unlock new activities</option><option value="custom">My saved priority order</option></select>
         <label class="f" for="mbx-easy-check">How often to re-check while idle</label>
-        <select id="mbx-easy-check"><option value="30">30 seconds</option><option value="60">1 minute</option><option value="120">2 minutes</option><option value="300">5 minutes</option><option value="1800">30 minutes (default)</option></select>
-        <div class="hint">30 minutes is the idle ceiling, not a forced sleep: resource readiness, OC phases, smuggling, Workshop, Empire and other active deadlines can wake the bot earlier.</div>
+        <select id="mbx-easy-check"><option value="30">30 seconds</option><option value="60">1 minute</option><option value="120">2 minutes (default)</option><option value="300">5 minutes</option></select>
+        <div class="hint">2 minutes is the default idle ceiling, not a forced sleep: resource readiness, OC phases, smuggling, Workshop, Empire and other active deadlines can wake the bot earlier.</div>
         <label class="settings-toggle"><span>Automatic CAPTCHA assistance</span><input type="checkbox" data-easy="autoSolveChallenges"></label>
         <label class="settings-toggle"><span>Only one bot tab at once</span><input type="checkbox" data-easy="scheduler.singleTab"></label>
         <label class="settings-toggle"><span>Follow the activity being performed</span><input type="checkbox" data-easy="followPage"></label>
@@ -4783,7 +4790,7 @@ async function garageApiSweep() {
         <div class="mini-note">Default $1,000,000. Buy only when current cash exceeds this amount; the biggest affordable pack is selected. Two purchases are allowed before the factory's cooldown. Other bot activities continue between checks.</div>
         <label class="settings-toggle"><span>Crush low-capacity cars in current district</span><input type="checkbox" data-easy="garage.crushLocal"></label>
         <div class="action-row"><button class="soft-btn" id="mbx-advanced">Advanced controls</button><button class="soft-btn" id="mbx-export-easy">Export diagnostics</button></div>
-        <details class="guide"><summary>How does idle waiting work?</summary><p>When nothing is ready, the bot can sleep up to 30 minutes. It still checks earlier for game-specific cooldowns, near-full Empire income, OC actions and predicted resource readiness. A successful action continues after the normal short action gap; server rate limits remain authoritative.</p></details>
+        <details class="guide"><summary>How does idle waiting work?</summary><p>When nothing is ready, the bot can sleep up to your selected idle-check interval (2 minutes by default, 5 minutes maximum). It still checks earlier for game-specific cooldowns, near-full Empire income, OC actions and predicted resource readiness. A successful action continues after the normal short action gap; server rate limits remain authoritative.</p></details>
       </div>`;
       const cityA=bd.querySelector('#mbx-easy-city-a'),cityB=bd.querySelector('#mbx-easy-city-b');
       const routeStatus=bd.querySelector('#mbx-easy-trade-route');
@@ -4815,7 +4822,7 @@ async function garageApiSweep() {
       updateTradingRouteStatus();
       const mode=bd.querySelector('#mbx-easy-mode');mode.value=S.scheduler.mode;mode.onchange=e=>{setStrategy(e.target.value);renderBody();};
       const idle=bd.querySelector('#mbx-easy-check');idle.value=String(S.scheduler.idleCadenceSeconds);
-      if(!idle.value || idle.selectedIndex<0)idle.value='1800';
+      if(!idle.value || idle.selectedIndex<0)idle.value='120';
       idle.onchange=e=>{S.scheduler.idleCadenceSeconds=Number(e.target.value);save();st.nextAction=0;};
       const bulletThreshold=bd.querySelector('#mbx-easy-bullets-threshold');
       if(bulletThreshold){
