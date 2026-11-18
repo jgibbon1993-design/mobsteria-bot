@@ -1906,7 +1906,6 @@ async function garageApiSweep() {
       '); '+(damaged.length-repairIds.length)+' damaged remain, crusher waits for all');
     return true;
   }
-  if(!local.length){garageWarn('Scanned '+pages+' garage pages: none in '+home);return false;}
   if(!S.garage.crushLocal){garageWarn('Scanned '+pages+' garage pages; crushing disabled');return false;}
   if(S.modules.oc && ['active','planning'].includes(st.ocPhase)){
     garageWarn('OC underway; preserving possible driver cars until finished');return false;
@@ -1961,6 +1960,7 @@ async function garageApiSweep() {
       return true;
     }
   }
+  if(!local.length){garageWarn('Scanned '+pages+' garage pages: none in '+home);return false;}
   const fee=Number(first?.crusher?.price_per_car);
   if(first?.crusher?.available!==true||!Number.isFinite(fee)||fee<=0){
     garageWarn('Crusher unavailable or fee unverified');return false;
