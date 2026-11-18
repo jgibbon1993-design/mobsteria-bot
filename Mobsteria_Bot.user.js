@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.25
+// @version      2.3.26
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -91,10 +91,10 @@
     heists: { keepWit: 0 }, // effective OC reserve is configured in scheduler.witReserve
     gym: { stat: 'auto' }, // auto = lowest stat
     // Drugs are a fallback when no affordable item craft is ready.
-    drugs: ['Heroin'],
+    drugs: [...DRUG_LIST],
     workshop: { useEnhancer: false, rotate: 0, itemsFirst: true,
       drugsFallback: true, navigateToItems: true, maxItemCost: 25000, keepCash: 50000 },
-    smuggling: { minLoad: 20, autoTravelToComplete: false, minExpectedProfit: 1, keepCash: 50000, checkMinutes: 5, allowedDrugs: [...DRUG_LIST] },
+    smuggling: { minLoad: 20, autoTravelToComplete: true, minExpectedProfit: 1, keepCash: 50000, checkMinutes: 5, allowedDrugs: [...DRUG_LIST] },
     // Garage uses visible game controls only: no guessed garage endpoints.
     // Keep 60+ base cargo cars for smuggling. Never unlock cars automatically.
     garage: { minBaseCapacity: 60, checkMinutes: 45, maxCrushTotalFee: 100000,
