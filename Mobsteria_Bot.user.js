@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.30
+// @version      2.3.31
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3610,6 +3610,24 @@ async function garageApiSweep() {
     if(tradingDue)raise('trading');
     if(S.modules.smuggling && at-Number(st.lastSmuggleCheck||0)>=Number(S.smuggling.checkMinutes||5)*60000 &&
        at>=metric('smuggling').nextAllowed)raise('smuggling');
+    // Crimes can always succeed at the top of the default order, preventing
+    // focus/wit from ever reaching their GTA/heist module. Once either bar
+    // reaches its burst threshold, give it a fair turn ahead of routine crimes.
+    // Compare ready bars by saturation, then longest unchecked first. Empty
+    // or errored modules still obey their existing scheduler backoffs.
+    const resourceDue=[['gta','focus'],['heists','wit']].filter(([key,resource])=>{
+      if(!S.modules[key]||at<metric(key).nextAllowed)return false;
+      const bar=res(resource),current=Number(bar.current),cap=Number(bar.max);
+      if(!Number.isFinite(current)||!Number.isFinite(cap)||cap<=0)return false;
+      const threshold=S.scheduler.batchResources
+        ?Math.ceil(cap*resourceStartPct(resource)/100):Math.ceil(cap*.85);
+      return current>=threshold && current>resourceFloor(resource);
+    }).sort(([ak,ar],[bk,br])=>{
+      const af=Number(res(ar).current)/Number(res(ar).max);
+      const bf=Number(res(br).current)/Number(res(br).max);
+      return bf-af || Number(metric(ak).lastCheckAt||0)-Number(metric(bk).lastCheckAt||0);
+    });
+    if(resourceDue.length)raise(resourceDue[0][0]);
     // Never make a crew wait behind routine work when an OC is active or
     // preparing a contribution. An actual OC cooldown still wins.
     if(S.modules.oc && (st.ocPhase==='active' || st.ocPhase==='planning') &&
