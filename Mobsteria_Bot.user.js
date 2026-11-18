@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.31
+// @version      2.3.32
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3481,42 +3481,14 @@ async function garageApiSweep() {
     return false;
   }
 
-  // Burglary is now part of the single Crimes slot (not a separate module).
-  async function doCrimeGroupOne() {
-    if (S.crimes.mixEnabled && S.modules.burglary && preferredCrimeType()==='burglary') {
-      if (await doBurglary()) return true;
+  // Burglary shares the Crimes slot. Execute one verified crime action per
+  // scheduler turn; the earlier five-action inner loop could monopolise the
+  // only scheduler and prevent focus/wit/nerve fairness.
+  async function doCrimeGroup() {
+    if(S.crimes.mixEnabled && S.modules.burglary && preferredCrimeType()==='burglary'){
+      if(await doBurglary())return true;
     }
     return doCrimes();
-  }
-  async function doCrimeGroup() {
-    // Complete a modest sequential nerve-spend burst; never issue concurrent
-    // crime requests or reuse old nerve/target data. Honour configured delays,
-    // resource floors, server rate limits and challenge/jail/health guards.
-    const maxAttempts=5;
-    const started=now();
-    let completed=0;
-    for(let i=0;i<maxAttempts;i++){
-      if(!S.running||st.challenge||isJailed()||isHospital()||
-         (S.modules.oc&&['active','planning'].includes(st.ocPhase)&&i>0))break;
-      if(i>0){
-        const min=Math.max(1500,Number(S.delays.min)||2500);
-        const max=Math.max(min,Number(S.delays.max)||6000);
-        await sleep(rand(min,max));
-        await refreshChar(true);
-        if(now()-started>35000||!S.running||st.challenge||isJailed()||
-           isHospital()||cur('nerve')<=Math.max(num(S.crimes.keepNerve),resourceFloor('nerve')))break;
-      }
-      const acted=await doCrimeGroupOne();
-      if(!acted)break;
-      completed++;
-    }
-    if(completed>1){
-      // Scheduler counts one successful turn; account for extra actions in the burst.
-      st.stats.actions+=completed-1;
-      telemetryDirty=true;
-      log('Crimes: completed '+completed+' sequential actions in one nerve-spend burst','good');
-    }
-    return completed>0;
   }
 
   const MODULE_ORDER = [
@@ -3610,12 +3582,10 @@ async function garageApiSweep() {
     if(tradingDue)raise('trading');
     if(S.modules.smuggling && at-Number(st.lastSmuggleCheck||0)>=Number(S.smuggling.checkMinutes||5)*60000 &&
        at>=metric('smuggling').nextAllowed)raise('smuggling');
-    // Crimes can always succeed at the top of the default order, preventing
-    // focus/wit from ever reaching their GTA/heist module. Once either bar
-    // reaches its burst threshold, give it a fair turn ahead of routine crimes.
-    // Compare ready bars by saturation, then longest unchecked first. Empty
-    // or errored modules still obey their existing scheduler backoffs.
-    const resourceDue=[['gta','focus'],['heists','wit']].filter(([key,resource])=>{
+    // Every spendable resource deserves a turn, even when crimes are already
+    // running successfully. Give ready nerve, focus and wit modules fair
+    // access to the single scheduler, without nested multi-action loops.
+    const resourceDue=[['crimes','nerve'],['gta','focus'],['heists','wit']].filter(([key,resource])=>{
       if(!S.modules[key]||at<metric(key).nextAllowed)return false;
       const bar=res(resource),current=Number(bar.current),cap=Number(bar.max);
       if(!Number.isFinite(current)||!Number.isFinite(cap)||cap<=0)return false;
@@ -3623,9 +3593,12 @@ async function garageApiSweep() {
         ?Math.ceil(cap*resourceStartPct(resource)/100):Math.ceil(cap*.85);
       return current>=threshold && current>resourceFloor(resource);
     }).sort(([ak,ar],[bk,br])=>{
-      const af=Number(res(ar).current)/Number(res(ar).max);
-      const bf=Number(res(br).current)/Number(res(br).max);
-      return bf-af || Number(metric(ak).lastCheckAt||0)-Number(metric(bk).lastCheckAt||0);
+      // The oldest last-check wins among ready resources. This prevents a
+      // regenerating full nerve bar from continually beating GTA/heists.
+      const age=Number(metric(ak).lastCheckAt||0)-Number(metric(bk).lastCheckAt||0);
+      if(age!==0)return age;
+      return Number(res(br).current)/Number(res(br).max)-
+        Number(res(ar).current)/Number(res(ar).max);
     });
     if(resourceDue.length)raise(resourceDue[0][0]);
     // Never make a crew wait behind routine work when an OC is active or
