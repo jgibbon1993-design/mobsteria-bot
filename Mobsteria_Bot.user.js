@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.29
+// @version      2.3.30
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -353,6 +353,7 @@
     busy: false,
     lastBusts: [],
     lastWorkshopCheck: 0,
+    workshopWaitUntil: 0,
     lastWorkshopItemNav: 0,
     lastWorkshopUiStep: 0,
     lastWorkshopWarning: '',
@@ -545,7 +546,12 @@
     if(key==='oc' && st.ocPhase==='planning') return 45000;
     if(key==='empire')return Math.max(120000,Number(S.empire.checkMinutes||15)*60000);
     // Check for newly freed workshop queue space without delaying other modules.
-    if(key==='workshop')return 30000;
+    if(key==='workshop'){
+      // The queue drains in the background. Wake at its predicted empty time,
+      // rather than repeatedly topping it up as each 10-minute craft finishes.
+      const remaining=Number(st.workshopWaitUntil||0)-now();
+      return remaining>0?Math.max(30000,Math.min(3600000,remaining+1000)):30000;
+    }
     if(key==='trading'){
       if(tradePlan()||tradePending()||tradeTravelPending())return 25000;
       if(tradingPair() && S.trading.loopTravel){
@@ -1441,7 +1447,7 @@
     const old=new Set((pending.queuedBefore||[]).map(String));
     return (lab?.queue?.items||[]).some(x=>String(x.name||'')===pending.name && x.id!=null && !old.has(String(x.id)));
   }
-  async function doWorkshopSingle() {
+  async function doWorkshopSingle(allowPartial=false) {
     if(now()-st.lastWorkshopCheck<20000)return false;
     st.lastWorkshopCheck=now();
     const lab=await GET('/lab');
@@ -1464,6 +1470,16 @@
     }
     const durationLimit=Number(queue.max_queue_duration);
     const waiting=Number(queue.queue_wait_seconds);
+    // Only begin a new fill when the previous queue has completely drained.
+    // During THIS fill, allow later submissions to see a partially-filled queue.
+    if(!allowPartial && ((Number.isFinite(waiting)&&waiting>0) ||
+       (Array.isArray(queue.items)&&queue.items.length>0))){
+      st.workshopWaitUntil=Number.isFinite(waiting)&&waiting>0
+        ?now()+waiting*1000 :now()+60000;
+      workshopWarn('Batch queued: waiting until all crafts finish before refilling');
+      return false;
+    }
+    if(!allowPartial)st.workshopWaitUntil=0;
     if(queue.is_full===true || (Number.isFinite(durationLimit) &&
        Number.isFinite(waiting) && durationLimit>0 && waiting>=durationLimit)){
       workshopWarn('Queue full; checking again when space becomes available');
@@ -1559,13 +1575,12 @@
   }
 
   async function doWorkshop() {
-    // Fill the verified queue in a single scheduled turn. Each action is
-    // sequential, followed by a fresh lab snapshot in doWorkshopSingle().
-    // Stop on full queue, unconfirmed response, missing resources, or errors.
-    // Other modules continue to run normally after this short bounded burst.
+    // Start only with an empty queue, then fill up to six crafts in one pass.
+    // When the pass ends, wait for the entire queue to finish before starting
+    // another pass. Other modules remain active while the workshop waits.
     let completed=0;
     const start=now();
-    for(let n=0;n<12 && now()-start<60000;n++){
+    for(let n=0;n<6 && now()-start<60000;n++){
       if(!S.running||st.challenge||isJailed()||isHospital()||
          (n>0 && S.modules.oc && ['active','planning'].includes(st.ocPhase)))break;
       if(n>0){
@@ -1576,7 +1591,7 @@
         st.lastWorkshopCheck=0;
         if(!S.running||st.challenge||isJailed()||isHospital())break;
       }
-      const done=await doWorkshopSingle();
+      const done=await doWorkshopSingle(n>0);
       if(!done)break;
       completed++;
       if(st.workshopPending)break; // Never submit a second craft after ambiguity.
@@ -1584,7 +1599,7 @@
     if(completed>1){
       st.stats.actions+=completed-1;
       telemetryDirty=true;
-      log('Workshop: filled '+completed+' queue slots in one pass','good');
+      log('Workshop: queued '+completed+' crafts; waiting for entire queue to finish before the next batch','good');
     }
     return completed>0;
   }
