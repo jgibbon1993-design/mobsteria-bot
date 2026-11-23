@@ -4560,7 +4560,9 @@ async function garageApiSweep() {
       String(GM_getValue(GEMINI_KEY_STORE,'')||''));
     if(value===null)return;
     GM_setValue(GEMINI_KEY_STORE,value.trim());
+    attemptedSolves.clear(); // Allow a previously blocked photographic puzzle to retry with the new key.
     log(value.trim()?'Gemini Vision key saved locally':'Gemini Vision key cleared','info');
+    if(value.trim())inspectChallenge();
   });
   document.addEventListener('click',e=>{
     if(e.target?.closest?.('#mbx-test-nocaptcha-route')){testPhotoProviderRoute();return;}
