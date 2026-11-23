@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.38-test
+// @version      2.3.39-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3759,7 +3759,10 @@ async function garageApiSweep() {
   // Experimental photographic category solver; API key is stored locally.
   const PHOTO_KEY_STORE='mbx_nocaptchaai_key_local';
   const GEMINI_KEY_STORE='mbx_gemini_photo_key_local';
-  const GEMINI_MODEL='gemini-3.8-flash';
+  const GEMINI_MODEL='gemini-3.6-flash';
+  const GEMINI_FALLBACK_MODEL='gemini-3.5-flash-lite';
+  const photoRetryAfter=new Map();
+  const photoRetryCount=new Map();
   const PHOTO_RE=/\bselect\s+all\s+images\s+(not\s+)?related\s+to\s+([a-z -]+?)[.!]?\s*$/i;
   function photoChallengeRule(question){
     const m=String(question||'').match(PHOTO_RE);
@@ -3846,11 +3849,17 @@ async function garageApiSweep() {
         if(r.status<200||r.status>=300){
           const reason=String(data?.error?.message||data?.message||'request rejected')
             .replaceAll(key,'[redacted]').slice(0,180);
-          return reject(new Error('Gemini HTTP '+r.status+': '+reason));
+          const err=new Error('Gemini HTTP '+r.status+': '+reason);
+          err.status=r.status;
+          err.transient=[408,429,500,502,503,504].includes(r.status);
+          return reject(err);
         }
         resolve(data);
       },
-      ontimeout:()=>reject(new Error('Gemini timed out using Firefox network route')),
+      ontimeout:()=>{
+        const err=new Error('Gemini timed out using Firefox network route');
+        err.transient=true;reject(err);
+      },
       onerror:()=>reject(new Error('Gemini network error using Firefox proxy route'))
     }));
   }
@@ -3870,15 +3879,39 @@ async function garageApiSweep() {
       input.push({type:'text',text:'Photograph '+(i+1)+' of 8'});
       input.push({type:'image',data:images[i],mime_type:'image/png'});
     }
-    const response=await geminiApiRequest(
-      'https://generativelanguage.googleapis.com/v1beta/interactions',apiKey,{
-        model:GEMINI_MODEL,input,
-        response_format:{
-          type:'text',mime_type:'application/json',
-          schema:{type:'object',properties:{matches:{type:'array',items:{type:'boolean'}}},
-            required:['matches']}
+    // Prefer a reliable low-latency model. If Google is temporarily overloaded,
+    // retry once, then switch to the documented image-capable Flash-Lite model.
+    const payload={
+      model:GEMINI_MODEL,input,store:false,
+      response_format:{
+        type:'text',mime_type:'application/json',
+        schema:{type:'object',properties:{matches:{type:'array',items:{type:'boolean'}}},
+          required:['matches']}
+      }
+    };
+    let response=null,lastError=null;
+    for(const model of [GEMINI_MODEL,GEMINI_FALLBACK_MODEL]){
+      payload.model=model;
+      for(let attempt=0;attempt<2;attempt++){
+        if(attempt)await sleep(1300+Math.floor(Math.random()*750));
+        try{
+          response=await geminiApiRequest('https://generativelanguage.googleapis.com/v1beta/interactions',apiKey,payload);
+          log('Photo classification response received from '+model,'info');
+          break;
+        }catch(err){
+          lastError=err;
+          if(!err.transient && err.status!==404)throw err;
+          log('Gemini '+model+' unavailable ('+(err.status||'timeout')+')'+
+            (model===GEMINI_MODEL?' — will retry/fallback':' — will retry'),'warn');
         }
-      });
+      }
+      if(response)break;
+    }
+    if(!response){
+      const error=lastError||new Error('All Gemini photo models unavailable');
+      if(error.status===404)error.transient=true;
+      throw error;
+    }
     let raw=typeof response.output_text==='string'?response.output_text:'';
     if(!raw&&Array.isArray(response.output)){
       raw=response.output.map(item=>typeof item.text==='string'?item.text:
@@ -3907,7 +3940,7 @@ async function garageApiSweep() {
     const tiles=photoTiles();
     if(tiles.length!==8){solverStatusOnce('Photo grid not ready (expected eight individual tiles)');return true;}
     if(!dom.button){solverStatusOnce('Photo challenge verification button not found');return true;}
-    if(challengeSolving||attemptedSolves.has(key))return true;
+    if(challengeSolving||attemptedSolves.has(key)||Date.now()<(photoRetryAfter.get(key)||0))return true;
     challengeSolving=true;attemptedSolves.add(key);
     try{
       if(selectionCount(dom)!==0)throw new Error('Grid already has selected tiles');
@@ -3928,7 +3961,17 @@ async function garageApiSweep() {
       submit.click();log('Photo challenge submitted ('+chosen.length+' tiles); awaiting server confirmation','good');
     }catch(e){
       st.challengeRecoveryReason=String(e.message).slice(0,130);
-      log('Photo solver: '+e.message,'warn');renderStatus();
+      if(e.transient && selectionCount(challengeDom())===0){
+        const failures=(photoRetryCount.get(key)||0)+1;
+        photoRetryCount.set(key,failures);
+        const delay=Math.min(300000,10000*Math.pow(2,Math.min(failures-1,5)))+Math.floor(Math.random()*3000);
+        photoRetryAfter.set(key,Date.now()+delay);
+        attemptedSolves.delete(key);
+        log('Photo solver: '+e.message+' — automatically retrying in '+Math.ceil(delay/1000)+'s','warn');
+      }else{
+        log('Photo solver: '+e.message,'warn');
+      }
+      renderStatus();
     }finally{challengeSolving=false;}
     return true;
   }
@@ -5557,7 +5600,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.38-test loaded — Gemini photo classification, existing modules retained', 'info');
+    log('Mobsteria Bot V2.3.39-test loaded — Gemini automatic model fallback and retries', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
