@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.32
+// @version      2.3.33-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -10,6 +10,7 @@
 // @grant        GM_setValue
 // @connect      ntfy.sh
 // @connect      api.mobsteria.com
+// @connect      api.nocaptchaai.com
 // @updateURL    https://raw.githubusercontent.com/jgibbon1993-design/mobsteria-bot/main/Mobsteria_Bot.meta.js
 // @downloadURL  https://raw.githubusercontent.com/jgibbon1993-design/mobsteria-bot/main/Mobsteria_Bot.user.js
 // @run-at       document-idle
@@ -3726,6 +3727,7 @@ async function garageApiSweep() {
    *  Unknown/ambiguous challenges remain manual.
    * ========================================================= */
   const CHALLENGE_TYPES = [
+    [/\bselect\s+all\s+images\s+(?:not\s+)?related\s+to\s+/i, 'Photographic category'],
     [/\b(?:click|select)\s+the\s+group\s+(?:with|showing|containing|that\s+has)\s+(?:exactly\s+)?\d+\s+(?:items|shapes|objects)\b/i, 'Group counting'],
     [/\b(?:click|select)\s+(?:all\s+)?(?:the\s+)?(?:red|yellow|green|blue|purple|orange|pink)\b/i, 'Colour selection'],
     [/\b(?:click|select)\s+all\s+(?:the\s+)?(?:triangles?|circles?|squares?|stars?|hexagons?|diamonds?)\b/i, 'Shape selection'],
@@ -3739,7 +3741,7 @@ async function garageApiSweep() {
 
   function challengeDom() {
     const img = [...document.images].find(i =>
-      /\/storage\/temp\/challenge_|\/canvas\.png/i.test(i.src) || i.alt === 'Challenge');
+      /\/storage\/temp\/(?:challenge_|\d+\/[0-7]\.png)|\/canvas\.png/i.test(i.src) || i.alt === 'Challenge');
     if (!img || !img.getClientRects().length) return null;
     const visible = e => !!e.getClientRects().length && !e.closest('#mbx');
     const nodes = [...document.querySelectorAll('p.text-text-light.bold-text, p, h2, h3, h4')]
@@ -3749,7 +3751,97 @@ async function garageApiSweep() {
     const box = img.closest('.game-container') || img.parentElement?.parentElement?.parentElement || document;
     const button = [...box.querySelectorAll('button')]
       .find(b => /verify\s+selections?\s*\(/i.test(b.textContent || ''));
-    return { img, instruction, button };
+    const photoButton = photoChallengeRule(instruction) ? [...document.querySelectorAll('button')].find(b => /verify\s+selections?\s*\(/i.test(b.textContent||'') && !b.closest('#mbx')) : null;
+    return { img, instruction, button: photoButton || button };
+  }
+
+  // Experimental photographic category solver; API key is stored locally.
+  const PHOTO_KEY_STORE='mbx_nocaptchaai_key_local';
+  const PHOTO_RE=/\bselect\s+all\s+images\s+(not\s+)?related\s+to\s+([a-z -]+?)[.!]?\s*$/i;
+  function photoChallengeRule(question){
+    const m=String(question||'').match(PHOTO_RE);
+    return m?{negative:!!m[1],category:m[2].trim().replace(/[.]+$/,'')}:null;
+  }
+  function photoTiles(){
+    const candidates=[...document.querySelectorAll('img')].filter(i=>
+      /\/storage\/temp\/\d+\/[0-7]\.png(?:\?|$)/i.test(i.currentSrc||i.src) && i.getClientRects().length && !i.closest('#mbx'));
+    if(candidates.length!==8)return [];
+    return candidates.map(i=>({img:i,index:Number((i.currentSrc||i.src).match(/\/([0-7])\.png(?:\?|$)/)[1])})).sort((a,b)=>a.index-b.index);
+  }
+  function photoApi(method,url,payload){
+    return new Promise((resolve,reject)=>GM_xmlhttpRequest({method,url,timeout:25000,
+      headers:{'Content-Type':'application/json'},data:JSON.stringify(payload),
+      onload:r=>{let json;try{json=JSON.parse(r.responseText)}catch{return reject(new Error('AI returned invalid JSON'))}
+        if(r.status<200||r.status>=300||json.errorId)return reject(new Error('AI HTTP '+r.status+': '+String(json.errorDescription||json.errorCode||'unknown')));
+        resolve(json);},onerror:()=>reject(new Error('AI service unreachable')),
+      ontimeout:()=>reject(new Error('AI service timed out'))}));
+  }
+  function photoImageBase64(url){
+    return new Promise((resolve,reject)=>GM_xmlhttpRequest({method:'GET',url,responseType:'arraybuffer',timeout:15000,
+      onload:r=>{if(r.status!==200||!r.response)return reject(new Error('Tile fetch failed'));
+        const bytes=new Uint8Array(r.response);let binary='';for(let n=0;n<bytes.length;n+=8192){binary+=String.fromCharCode(...bytes.subarray(n,n+8192));}
+        resolve(btoa(binary));},onerror:()=>reject(new Error('Tile download failed')),
+      ontimeout:()=>reject(new Error('Tile download timed out'))}));
+  }
+  async function classifyPhotoChallenge(question,tiles){
+    const key=String(GM_getValue(PHOTO_KEY_STORE,'')||'').trim();
+    if(!key)throw new Error('NoCaptchaAI key missing: configure it in Advanced settings');
+    const images=await Promise.all(tiles.map(t=>photoImageBase64(t.img.currentSrc||t.img.src)));
+    const task={type:'prosoClassification',websiteURL:location.origin,images,question};
+    const created=await photoApi('POST','https://api.nocaptchaai.com/createTask',{clientKey:key,task});
+    let answer=created;
+    if(!Array.isArray(answer.answers)&&!Array.isArray(answer.solution?.answers)){
+      if(!created.taskId)throw new Error('AI did not return a task ID');
+      for(let n=0;n<12;n++){
+        await sleep(1800);
+        answer=await photoApi('POST','https://api.nocaptchaai.com/getTaskResult',{clientKey:key,taskId:created.taskId});
+        if(answer.status==='ready'||Array.isArray(answer.answers)||Array.isArray(answer.solution?.answers))break;
+        if(answer.status==='failed')throw new Error('AI task failed');
+      }
+    }
+    const bits=answer.answers||answer.solution?.answers;
+    if(!Array.isArray(bits)||bits.length!==8||bits.some(v=>typeof v!=='boolean'))
+      throw new Error('AI returned no usable eight-tile classification');
+    const positions=bits.flatMap((yes,i)=>yes?[tiles[i].index]:[]);
+    if(!positions.length||positions.length===8)throw new Error('AI classification is ambiguous (0 or 8 tiles)');
+    return positions;
+  }
+  function clickPhotoTile(tile){
+    const i=tile.img;
+    const target=i.closest('button,[role="button"],.cursor-pointer')||i.parentElement;
+    if(!target||!target.getClientRects().length)throw new Error('Photo tile not clickable');
+    target.click();
+  }
+  async function tryPhotoChallenge(dom,key){
+    const rule=photoChallengeRule(dom.instruction);
+    if(!rule)return false;
+    const tiles=photoTiles();
+    if(tiles.length!==8){solverStatusOnce('Photo grid not ready (expected eight individual tiles)');return true;}
+    if(!dom.button){solverStatusOnce('Photo challenge verification button not found');return true;}
+    if(challengeSolving||attemptedSolves.has(key))return true;
+    challengeSolving=true;attemptedSolves.add(key);
+    try{
+      if(selectionCount(dom)!==0)throw new Error('Grid already has selected tiles');
+      const original=tiles.map(t=>t.img.currentSrc||t.img.src).join('|');
+      log('Photo classification: '+dom.instruction,'info');
+      const chosen=await classifyPhotoChallenge(dom.instruction,tiles);
+      const current=photoTiles();
+      if(current.length!==8||current.map(t=>t.img.currentSrc||t.img.src).join('|')!==original)
+        throw new Error('Challenge changed while AI was processing');
+      for(let n=0;n<chosen.length;n++){
+        clickPhotoTile(current.find(t=>t.index===chosen[n]));
+        const ok=await waitForSelectionCount(n+1,dom.img.currentSrc||dom.img.src,1700);
+        if(!ok)throw new Error('Photo tile click not confirmed by game');
+      }
+      const submit=challengeDom()?.button;
+      if(!submit||submit.disabled||selectionCount(challengeDom())!==chosen.length)
+        throw new Error('Photo verification button not ready');
+      submit.click();log('Photo challenge submitted ('+chosen.length+' tiles); awaiting server confirmation','good');
+    }catch(e){
+      st.challengeRecoveryReason=String(e.message).slice(0,130);
+      log('Photo solver: '+e.message,'warn');renderStatus();
+    }finally{challengeSolving=false;}
+    return true;
   }
 
   function challengeRule(text) {
@@ -4231,6 +4323,7 @@ async function garageApiSweep() {
     if (S.scheduler.singleTab && !canRunTab()) return;
     if (!S.autoSolveChallenges) { solverStatusOnce('Auto-solve is OFF in Settings — detection only.'); return; }
     if (challengeSolving || attemptedSolves.has(key)) return;
+    if (await tryPhotoChallenge(dom,key)) return;
     const rule = challengeRule(dom.instruction);
     if (!rule) {
       solverStatusOnce(`Question not supported: ${dom.instruction || '(missing instruction)'}`);
@@ -4272,7 +4365,7 @@ async function garageApiSweep() {
       log(`Local solver stopped: ${e.message}. Complete this challenge manually or press New CAPTCHA.`, 'warn');
       st.challengeRecoveryReason=String(e.message).slice(0,130);
       renderStatus();
-      notify('Mobsteria: manual challenge', `Local solver stopped: ${e.message}`);
+      // Diagnostics retained in Activity; no notification.
     } finally {
       challengeSolving = false;
     }
@@ -4309,7 +4402,7 @@ async function garageApiSweep() {
     if (st.challenge) return;
     st.challenge=true;
     log('Challenge detected - paused until verified.', 'bad');
-    notify('Mobsteria: challenge', 'Trying local recognition; manual verification may be needed.');
+    // Attempt solving silently.
     renderStatus();
     // An API request can discover the challenge before the game's UI actually
     // displays it. The saved Mobsteria page confirms /game/gta hosts this view.
@@ -4334,12 +4427,21 @@ async function garageApiSweep() {
         if(ov&&ov.needsChallenge===false) {
           st.challenge=false;
           log('Challenge cleared - resuming', 'good');
-          notify('Mobsteria: resumed', 'Challenge cleared, bot is running again.');
+          // Resume silently.
         }
       }catch {/* Keep waiting */}
     }
     renderStatus();
   }
+
+  document.addEventListener('click',e=>{
+    if(!e.target?.closest?.('#mbx-set-nocaptcha-key'))return;
+    const prior=GM_getValue(PHOTO_KEY_STORE,'');
+    const value=window.prompt('NoCaptchaAI API key (stored locally in Tampermonkey):',prior||'');
+    if(value===null)return;
+    GM_setValue(PHOTO_KEY_STORE,value.trim());
+    log(value.trim()?'Photo puzzle API key saved locally':'Photo puzzle API key cleared','info');
+  });
 
   /* =========================================================
    *  MAIN LOOP
@@ -5136,6 +5238,7 @@ async function garageApiSweep() {
           <div class="tog"><span>Close achievement &amp; level-up pop-ups</span><div class="sw" data-b="closePopups"></div></div>
           <div class="tog"><span>Detect and describe challenges</span><div class="sw" data-b="challengeAssist"></div></div>
           <div class="tog"><span>Auto-solve supported CAPTCHAs (local)</span><div class="sw" data-b="autoSolveChallenges"></div></div>
+          <button type="button" class="soft-btn" id="mbx-set-nocaptcha-key">Set NoCaptchaAI key (photo puzzles)</button>
           <div class="row2">
             <div><label class="f">Refresh if stuck (min)</label><input type="number" min="0" data-k="stuckReloadMins"></div>
             <div><label class="f">Refresh every (min)</label><input type="number" min="0" data-k="autoReloadMins"></div>
