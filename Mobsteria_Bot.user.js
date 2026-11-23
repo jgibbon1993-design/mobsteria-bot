@@ -4488,7 +4488,7 @@ async function garageApiSweep() {
         const bal=data.balance??data.credit??data.credits??data.data?.balance;
         const credit=(typeof bal==='number'||typeof bal==='string')&&Number.isFinite(Number(bal))?Number(bal):null;
         log('NoCaptchaAI Firefox route: HTTP '+r.status+(credit!==null?' · balance '+credit:'')+
-          (r.status===200?' · browser-profile route OK':' · request rejected'),' '+(r.status===200?'good':'warn').trim());
+          (r.status===200?' · browser-profile route OK':' · request rejected'),(r.status===200?'good':'warn'));
       },
       onerror:()=>log('NoCaptchaAI Firefox route: network error (check Firefox proxy)','warn'),
       ontimeout:()=>log('NoCaptchaAI Firefox route: timed out (check Firefox proxy)','warn')
