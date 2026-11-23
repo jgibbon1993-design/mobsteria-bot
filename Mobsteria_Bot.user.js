@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.34-test
+// @version      2.3.35-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3792,30 +3792,59 @@ async function garageApiSweep() {
         resolve(btoa(binary));},onerror:()=>reject(new Error('Tile download failed')),
       ontimeout:()=>reject(new Error('Tile download timed out'))}));
   }
+  // v2.3.35 experiment: documented ClassificationTask accepts ONE base64 image per task.
+  // Never guess if the API responds with unrecognised classification fields.
+  function explicitPhotoBoolean(data) {
+    const sol=data?.solution||{};
+    const candidates=[sol.answer,sol.result,sol.label,sol.text,sol.classification,
+      data.answer,data.result,data.label,data.text,data.classification];
+    for(const value of candidates){
+      if(typeof value==='boolean')return value;
+      if(typeof value==='number'&&(value===0||value===1))return value===1;
+      if(typeof value!=='string')continue;
+      const v=value.trim().toLowerCase();
+      if(/^(yes|true|1|present|contains|match|positive)$/i.test(v))return true;
+      if(/^(no|false|0|absent|does not contain|not present|no match|negative)$/i.test(v))return false;
+    }
+    const diagnostic=JSON.stringify(sol||{}).slice(0,160);
+    throw new Error('Unsupported ClassificationTask answer format: '+diagnostic);
+  }
+  async function classifyPhotoTile(key,body,category,index) {
+    const payload={clientKey:key,task:{
+      type:'ClassificationTask',
+      body,
+      question:'Does this image contain a '+category+'? Answer YES or NO.'
+    }};
+    const created=await photoApi('POST','https://api.nocaptchaai.com/createTask',payload);
+    if(!created.taskId && created.status!=='ready')
+      throw new Error('Tile '+index+': ClassificationTask returned no taskId');
+    let answer=created;
+    for(let n=0;answer.status!=='ready'&&n<16;n++){
+      if(answer.status==='failed')throw new Error('Tile '+index+': AI classification failed');
+      await sleep(1500);
+      answer=await photoApi('POST','https://api.nocaptchaai.com/getTaskResult',{clientKey:key,taskId:created.taskId});
+    }
+    if(answer.status!=='ready')throw new Error('Tile '+index+': classification timed out');
+    return explicitPhotoBoolean(answer);
+  }
   async function classifyPhotoChallenge(question,tiles){
     const key=String(GM_getValue(PHOTO_KEY_STORE,'')||'').trim();
     if(!key)throw new Error('NoCaptchaAI key missing: configure it in Advanced settings');
+    const rule=photoChallengeRule(question);
+    if(!rule)throw new Error('Photo instruction not recognised');
     const images=await Promise.all(tiles.map(t=>photoImageBase64(t.img.currentSrc||t.img.src)));
-    const task={type:'prosoClassification',websiteURL:location.origin,images,question};
-    const created=await photoApi('POST','https://api.nocaptchaai.com/createTask',{clientKey:key,task});
-    let answer=created;
-    if(!Array.isArray(answer.answers)&&!Array.isArray(answer.solution?.answers)){
-      if(!created.taskId)throw new Error('AI did not return a task ID');
-      for(let n=0;n<12;n++){
-        await sleep(1800);
-        answer=await photoApi('POST','https://api.nocaptchaai.com/getTaskResult',{clientKey:key,taskId:created.taskId});
-        if(answer.status==='ready'||Array.isArray(answer.answers)||Array.isArray(answer.solution?.answers))break;
-        if(answer.status==='failed')throw new Error('AI task failed');
-      }
+    const matches=[];
+    for(let i=0;i<tiles.length;i++){
+      // Run only one pending provider task at a time. No guesses or repeated submits.
+      const contains=await classifyPhotoTile(key,images[i],rule.category,tiles[i].index);
+      if(rule.negative?!contains:contains)matches.push(tiles[i].index);
+      log('Photo tile '+(i+1)+'/8 classified','info');
     }
-    const bits=answer.answers||answer.solution?.answers;
-    if(!Array.isArray(bits)||bits.length!==8||bits.some(v=>typeof v!=='boolean'))
-      throw new Error('AI returned no usable eight-tile classification');
-    const positions=bits.flatMap((yes,i)=>yes?[tiles[i].index]:[]);
-    if(!positions.length||positions.length===8)throw new Error('AI classification is ambiguous (0 or 8 tiles)');
-    return positions;
+    if(!matches.length||matches.length===8)
+      throw new Error('Photo classification ambiguous (0 or 8 matching tiles); refusing to submit');
+    return matches;
   }
-  function clickPhotoTile(tile){
+    function clickPhotoTile(tile){
     const i=tile.img;
     const target=i.closest('button,[role="button"],.cursor-pointer')||i.parentElement;
     if(!target||!target.getClientRects().length)throw new Error('Photo tile not clickable');
