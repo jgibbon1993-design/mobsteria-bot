@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.36-test
+// @version      2.3.37-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -4472,6 +4472,31 @@ async function garageApiSweep() {
     renderStatus();
   }
 
+  // Firefox-route diagnostic, matching the TMN balance endpoint.
+  // Uses the browser profile's network/proxy route, not Railway.
+  function testPhotoProviderRoute() {
+    const key=String(GM_getValue(PHOTO_KEY_STORE,'')||'').trim();
+    if(!key){log('NoCaptchaAI Firefox route: API key not configured','warn');return;}
+    log('Checking NoCaptchaAI over Firefox browser-profile route…','info');
+    GM_xmlhttpRequest({
+      method:'GET',
+      url:'https://api.nocaptchaai.com/balance?apiKey='+encodeURIComponent(key),
+      headers:{'Accept':'application/json','apikey':key},
+      timeout:20000,
+      onload:r=>{
+        let data={};try{data=JSON.parse(r.responseText||'{}')}catch{}
+        const bal=data.balance??data.credit??data.credits??data.data?.balance;
+        const credit=(typeof bal==='number'||typeof bal==='string')&&Number.isFinite(Number(bal))?Number(bal):null;
+        log('NoCaptchaAI Firefox route: HTTP '+r.status+(credit!==null?' · balance '+credit:'')+
+          (r.status===200?' · browser-profile route OK':' · request rejected'),' '+(r.status===200?'good':'warn').trim());
+      },
+      onerror:()=>log('NoCaptchaAI Firefox route: network error (check Firefox proxy)','warn'),
+      ontimeout:()=>log('NoCaptchaAI Firefox route: timed out (check Firefox proxy)','warn')
+    });
+  }
+  document.addEventListener('click',e=>{
+    if(e.target?.closest?.('#mbx-test-nocaptcha-route')){testPhotoProviderRoute();return;}
+  });
   document.addEventListener('click',e=>{
     if(!e.target?.closest?.('#mbx-set-nocaptcha-key'))return;
     const prior=GM_getValue(PHOTO_KEY_STORE,'');
@@ -5276,7 +5301,7 @@ async function garageApiSweep() {
           <div class="tog"><span>Close achievement &amp; level-up pop-ups</span><div class="sw" data-b="closePopups"></div></div>
           <div class="tog"><span>Detect and describe challenges</span><div class="sw" data-b="challengeAssist"></div></div>
           <div class="tog"><span>Auto-solve supported CAPTCHAs (local)</span><div class="sw" data-b="autoSolveChallenges"></div></div>
-          <button type="button" class="soft-btn" id="mbx-set-nocaptcha-key">Set NoCaptchaAI key (photo puzzles)</button>
+          <button type="button" class="soft-btn" id="mbx-set-nocaptcha-key">Set NoCaptchaAI key (photo puzzles)</button>\n          <button type="button" class="soft-btn" id="mbx-test-nocaptcha-route">Test NoCaptchaAI Firefox route</button>
           <div class="row2">
             <div><label class="f">Refresh if stuck (min)</label><input type="number" min="0" data-k="stuckReloadMins"></div>
             <div><label class="f">Refresh every (min)</label><input type="number" min="0" data-k="autoReloadMins"></div>
