@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.37-test
+// @version      2.3.38-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -11,6 +11,7 @@
 // @connect      ntfy.sh
 // @connect      api.mobsteria.com
 // @connect      api.nocaptchaai.com
+// @connect      generativelanguage.googleapis.com
 // @updateURL    https://raw.githubusercontent.com/jgibbon1993-design/mobsteria-bot/main/Mobsteria_Bot.meta.js
 // @downloadURL  https://raw.githubusercontent.com/jgibbon1993-design/mobsteria-bot/main/Mobsteria_Bot.user.js
 // @run-at       document-idle
@@ -3757,6 +3758,8 @@ async function garageApiSweep() {
 
   // Experimental photographic category solver; API key is stored locally.
   const PHOTO_KEY_STORE='mbx_nocaptchaai_key_local';
+  const GEMINI_KEY_STORE='mbx_gemini_photo_key_local';
+  const GEMINI_MODEL='gemini-3.8-flash';
   const PHOTO_RE=/\bselect\s+all\s+images\s+(not\s+)?related\s+to\s+([a-z -]+?)[.!]?\s*$/i;
   function photoChallengeRule(question){
     const m=String(question||'').match(PHOTO_RE);
@@ -3827,24 +3830,72 @@ async function garageApiSweep() {
     if(answer.status!=='ready')throw new Error('Tile '+index+': classification timed out');
     return explicitPhotoBoolean(answer);
   }
+  // CapSolver's published classification tasks do not document arbitrary 2x4
+  // grids or categories such as birds/fish/nature. Use a general-purpose vision
+  // model only when the user explicitly provides a Gemini API key.
+  function geminiApiRequest(url,key,payload){
+    return new Promise((resolve,reject)=>GM_xmlhttpRequest({
+      method:payload?'POST':'GET',url,timeout:55000,
+      headers:{'Content-Type':'application/json','x-goog-api-key':key},
+      ...(payload?{data:JSON.stringify(payload)}:{}),
+      onload:r=>{
+        let data={};
+        try{data=JSON.parse(r.responseText||'{}');}catch{
+          return reject(new Error('Gemini HTTP '+r.status+' returned invalid JSON'));
+        }
+        if(r.status<200||r.status>=300){
+          const reason=String(data?.error?.message||data?.message||'request rejected')
+            .replaceAll(key,'[redacted]').slice(0,180);
+          return reject(new Error('Gemini HTTP '+r.status+': '+reason));
+        }
+        resolve(data);
+      },
+      ontimeout:()=>reject(new Error('Gemini timed out using Firefox network route')),
+      onerror:()=>reject(new Error('Gemini network error using Firefox proxy route'))
+    }));
+  }
   async function classifyPhotoChallenge(question,tiles){
-    const key=String(GM_getValue(PHOTO_KEY_STORE,'')||'').trim();
-    if(!key)throw new Error('NoCaptchaAI key missing: configure it in Advanced settings');
+    const apiKey=String(GM_getValue(GEMINI_KEY_STORE,'')||'').trim();
+    if(!apiKey)throw new Error('Photographic CAPTCHA requires a Gemini API key: Advanced > Set Gemini Vision key. CapSolver does not document this custom grid.');
     const rule=photoChallengeRule(question);
     if(!rule)throw new Error('Photo instruction not recognised');
     const images=await Promise.all(tiles.map(t=>photoImageBase64(t.img.currentSrc||t.img.src)));
-    const matches=[];
-    for(let i=0;i<tiles.length;i++){
-      // Run only one pending provider task at a time. No guesses or repeated submits.
-      const contains=await classifyPhotoTile(key,images[i],rule.category,tiles[i].index);
-      if(rule.negative?!contains:contains)matches.push(tiles[i].index);
-      log('Photo tile '+(i+1)+'/8 classified','info');
+    const prompt='Classify the eight separate photographs that follow, in their supplied order. '+
+      'For EACH photograph answer whether it depicts or is semantically related to the category: "'+
+      rule.category+'". Return exactly eight booleans in an array named matches, in image order. '+
+      'Mark true when related and false otherwise. Do NOT apply any NOT/inverse selection instruction; '+
+      'the application will do that after classification. Do not guess when uncertain.';
+    const input=[{type:'text',text:prompt}];
+    for(let i=0;i<images.length;i++){
+      input.push({type:'text',text:'Photograph '+(i+1)+' of 8'});
+      input.push({type:'image',data:images[i],mime_type:'image/png'});
     }
-    if(!matches.length||matches.length===8)
+    const response=await geminiApiRequest(
+      'https://generativelanguage.googleapis.com/v1beta/interactions',apiKey,{
+        model:GEMINI_MODEL,input,
+        response_format:{
+          type:'text',mime_type:'application/json',
+          schema:{type:'object',properties:{matches:{type:'array',items:{type:'boolean'}}},
+            required:['matches']}
+        }
+      });
+    let raw=typeof response.output_text==='string'?response.output_text:'';
+    if(!raw&&Array.isArray(response.output)){
+      raw=response.output.map(item=>typeof item.text==='string'?item.text:
+        (Array.isArray(item.content)?item.content.map(part=>part.text||'').join(''):'')).join('');
+    }
+    if(!raw)throw new Error('Gemini returned no text classification');
+    let parsed;
+    try{parsed=JSON.parse(raw);}catch{throw new Error('Gemini classification was not valid JSON');}
+    const bits=parsed?.matches;
+    if(!Array.isArray(bits)||bits.length!==8||bits.some(v=>typeof v!=='boolean'))
+      throw new Error('Gemini returned no usable eight-image boolean classification');
+    const chosen=bits.flatMap((related,i)=>(rule.negative?!related:related)?[tiles[i].index]:[]);
+    if(!chosen.length||chosen.length===8)
       throw new Error('Photo classification ambiguous (0 or 8 matching tiles); refusing to submit');
-    return matches;
+    return chosen;
   }
-    function clickPhotoTile(tile){
+  function clickPhotoTile(tile){
     const i=tile.img;
     const target=i.closest('button,[role="button"],.cursor-pointer')||i.parentElement;
     if(!target||!target.getClientRects().length)throw new Error('Photo tile not clickable');
@@ -4494,6 +4545,23 @@ async function garageApiSweep() {
       ontimeout:()=>log('NoCaptchaAI Firefox route: timed out (check Firefox proxy)','warn')
     });
   }
+  function testGeminiBrowserRoute(){
+    const key=String(GM_getValue(GEMINI_KEY_STORE,'')||'').trim();
+    if(!key){log('Gemini: set your API key in Advanced settings first','warn');return;}
+    log('Checking Gemini through Firefox browser-profile route…','info');
+    geminiApiRequest('https://generativelanguage.googleapis.com/v1beta/models/'+GEMINI_MODEL,key)
+      .then(data=>log('Gemini Firefox route OK: '+String(data.name||GEMINI_MODEL),'good'))
+      .catch(error=>log('Gemini route: '+String(error.message||error),'warn'));
+  }
+  document.addEventListener('click',e=>{
+    if(e.target?.closest?.('#mbx-test-gemini-route')){testGeminiBrowserRoute();return;}
+    if(!e.target?.closest?.('#mbx-set-gemini-key'))return;
+    const value=window.prompt('Gemini API key for photographic challenges (stored in Tampermonkey):',
+      String(GM_getValue(GEMINI_KEY_STORE,'')||''));
+    if(value===null)return;
+    GM_setValue(GEMINI_KEY_STORE,value.trim());
+    log(value.trim()?'Gemini Vision key saved locally':'Gemini Vision key cleared','info');
+  });
   document.addEventListener('click',e=>{
     if(e.target?.closest?.('#mbx-test-nocaptcha-route')){testPhotoProviderRoute();return;}
   });
@@ -5301,7 +5369,11 @@ async function garageApiSweep() {
           <div class="tog"><span>Close achievement &amp; level-up pop-ups</span><div class="sw" data-b="closePopups"></div></div>
           <div class="tog"><span>Detect and describe challenges</span><div class="sw" data-b="challengeAssist"></div></div>
           <div class="tog"><span>Auto-solve supported CAPTCHAs (local)</span><div class="sw" data-b="autoSolveChallenges"></div></div>
-          <button type="button" class="soft-btn" id="mbx-set-nocaptcha-key">Set NoCaptchaAI key (photo puzzles)</button>\n          <button type="button" class="soft-btn" id="mbx-test-nocaptcha-route">Test NoCaptchaAI Firefox route</button>
+          <div class="hint">Photo puzzles (birds, fish, nature): use Gemini Vision. CapSolver has no documented support for Mobsteria's custom 2x4 image grid.</div>
+          <button type="button" class="soft-btn" id="mbx-set-gemini-key">Set Gemini Vision key (photo puzzles)</button>
+          <button type="button" class="soft-btn" id="mbx-test-gemini-route">Test Gemini Firefox route</button>
+          <button type="button" class="soft-btn" id="mbx-set-nocaptcha-key">Legacy NoCaptchaAI key</button>
+          <button type="button" class="soft-btn" id="mbx-test-nocaptcha-route">Test NoCaptchaAI Firefox route</button>
           <div class="row2">
             <div><label class="f">Refresh if stuck (min)</label><input type="number" min="0" data-k="stuckReloadMins"></div>
             <div><label class="f">Refresh every (min)</label><input type="number" min="0" data-k="autoReloadMins"></div>
@@ -5483,7 +5555,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.12 loaded — paginated garage, compact Start/Stop', 'info');
+    log('Mobsteria Bot V2.3.38-test loaded — Gemini photo classification, existing modules retained', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
