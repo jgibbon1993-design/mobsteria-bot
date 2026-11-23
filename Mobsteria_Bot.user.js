@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.39-test
+// @version      2.3.40-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3912,12 +3912,24 @@ async function garageApiSweep() {
       if(error.status===404)error.transient=true;
       throw error;
     }
-    let raw=typeof response.output_text==='string'?response.output_text:'';
-    if(!raw&&Array.isArray(response.output)){
-      raw=response.output.map(item=>typeof item.text==='string'?item.text:
-        (Array.isArray(item.content)?item.content.map(part=>part.text||'').join(''):'')).join('');
+    // The REST Interactions API returns steps[].content[].text. output_text is
+    // primarily an SDK convenience property and usually absent from raw JSON.
+    const interaction=response?.interaction||response;
+    const steps=Array.isArray(interaction?.steps)?interaction.steps:[];
+    const modelOutputs=steps.filter(step=>step?.type==='model_output');
+    let raw=modelOutputs.flatMap(step=>Array.isArray(step.content)?
+      step.content.filter(part=>part?.type==='text'&&typeof part.text==='string').map(part=>part.text):[]).join('');
+    if(!raw&&typeof interaction?.output_text==='string')raw=interaction.output_text;
+    if(!raw&&Array.isArray(interaction?.output)){
+      raw=interaction.output.flatMap(part=>Array.isArray(part?.content)?
+        part.content.filter(c=>typeof c.text==='string').map(c=>c.text):
+        (typeof part?.text==='string'?[part.text]:[])).join('');
     }
-    if(!raw)throw new Error('Gemini returned no text classification');
+    if(!raw){
+      const status=String(interaction?.status||'unknown');
+      const stepTypes=steps.map(step=>String(step?.type||'?')).slice(-6).join(',');
+      throw new Error('Gemini no model text (status '+status+', steps '+(stepTypes||'none')+')');
+    }
     let parsed;
     try{parsed=JSON.parse(raw);}catch{throw new Error('Gemini classification was not valid JSON');}
     const bits=parsed?.matches;
@@ -5600,7 +5612,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.39-test loaded — Gemini automatic model fallback and retries', 'info');
+    log('Mobsteria Bot V2.3.40-test loaded — Gemini REST response parsing corrected', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
