@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.33-test
+// @version      2.3.34-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3771,8 +3771,17 @@ async function garageApiSweep() {
   function photoApi(method,url,payload){
     return new Promise((resolve,reject)=>GM_xmlhttpRequest({method,url,timeout:25000,
       headers:{'Content-Type':'application/json'},data:JSON.stringify(payload),
-      onload:r=>{let json;try{json=JSON.parse(r.responseText)}catch{return reject(new Error('AI returned invalid JSON'))}
-        if(r.status<200||r.status>=300||json.errorId)return reject(new Error('AI HTTP '+r.status+': '+String(json.errorDescription||json.errorCode||'unknown')));
+      onload:r=>{let json;try{json=JSON.parse(r.responseText)}catch{
+          return reject(new Error('AI HTTP '+r.status+' non-JSON reply: '+String(r.responseText||'empty').slice(0,180)));
+        }
+        if(r.status<200||r.status>=300||json.errorId){
+          const details=json.errorDescription||json.errorCode||json.message||json.error||
+            json.detail||json.details||json.errors||json.reason||json.title||json;
+          let msg=typeof details==='string'?details:JSON.stringify(details);
+          const secret=String(payload?.clientKey||'');
+          if(secret)msg=msg.replaceAll(secret,'[redacted]');
+          return reject(new Error('AI HTTP '+r.status+' (errorId '+String(json.errorId??'none')+'): '+String(msg).slice(0,300)));
+        }
         resolve(json);},onerror:()=>reject(new Error('AI service unreachable')),
       ontimeout:()=>reject(new Error('AI service timed out'))}));
   }
