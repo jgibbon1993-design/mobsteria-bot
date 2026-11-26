@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.42-test
+// @version      2.3.43-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3728,7 +3728,6 @@ async function garageApiSweep() {
    *  Unknown/ambiguous challenges remain manual.
    * ========================================================= */
   const CHALLENGE_TYPES = [
-    [/\bselect\s+all\s+(?:the\s+)?images\s+(?:(?:not\s+)?related\s+to|of|containing|showing|with)\s+/i, 'Photographic category'],
     [/\b(?:click|select)\s+the\s+group\s+(?:with|showing|containing|that\s+has)\s+(?:exactly\s+)?\d+\s+(?:items|shapes|objects)\b/i, 'Group counting'],
     [/\b(?:click|select)\s+(?:all\s+)?(?:the\s+)?(?:red|yellow|green|blue|purple|orange|pink)\b/i, 'Colour selection'],
     [/\b(?:click|select)\s+all\s+(?:the\s+)?(?:triangles?|circles?|squares?|stars?|hexagons?|diamonds?)\b/i, 'Shape selection'],
@@ -3748,11 +3747,11 @@ async function garageApiSweep() {
     const nodes = [...document.querySelectorAll('p.text-text-light.bold-text, p, h2, h3, h4')]
       .filter(visible);
     const instruction = nodes.map(e => (e.textContent || '').trim().replace(/\s+/g, ' '))
-      .find(t => /^(?:click|select)\s+/i.test(t)) || '';
+      .find(t => /^(?:click|select|choose|pick|tap|tick|mark|identify|which|find)\b/i.test(t)) || '';
     const box = img.closest('.game-container') || img.parentElement?.parentElement?.parentElement || document;
     const button = [...box.querySelectorAll('button')]
       .find(b => /verify\s+selections?\s*\(/i.test(b.textContent || ''));
-    const photoButton = photoChallengeRule(instruction) ? [...document.querySelectorAll('button')].find(b => /verify\s+selections?\s*\(/i.test(b.textContent||'') && !b.closest('#mbx')) : null;
+    const photoButton = photoTiles().length === 8 ? [...document.querySelectorAll('button')].find(b => /verify\s+selections?\s*\(/i.test(b.textContent||'') && !b.closest('#mbx')) : null;
     return { img, instruction, button: photoButton || button };
   }
 
@@ -3763,11 +3762,6 @@ async function garageApiSweep() {
   const GEMINI_FALLBACK_MODEL='gemini-3.5-flash-lite';
   const photoRetryAfter=new Map();
   const photoRetryCount=new Map();
-  const PHOTO_RE=/^\s*select\s+all\s+(?:the\s+)?images\s+(?:(not\s+)?related\s+to\s+|(?:of|containing|showing|with)\s+)(?:a\s+|an\s+|the\s+)?([a-z][a-z -]*?)[.!]?\s*$/i;
-  function photoChallengeRule(question){
-    const m=String(question||'').match(PHOTO_RE);
-    return m?{negative:!!m[1],category:m[2].trim().replace(/[.]+$/,'')}:null;
-  }
   function photoTiles(){
     const candidates=[...document.querySelectorAll('img')].filter(i=>
       /\/storage\/temp\/\d+\/[0-7]\.(?:png|webp)(?:\?|$)/i.test(i.currentSrc||i.src) && i.getClientRects().length && !i.closest('#mbx'));
@@ -3866,14 +3860,14 @@ async function garageApiSweep() {
   async function classifyPhotoChallenge(question,tiles){
     const apiKey=String(GM_getValue(GEMINI_KEY_STORE,'')||'').trim();
     if(!apiKey)throw new Error('Photographic CAPTCHA requires a Gemini API key: Advanced > Set Gemini Vision key. CapSolver does not document this custom grid.');
-    const rule=photoChallengeRule(question);
-    if(!rule)throw new Error('Photo instruction not recognised');
+    if(!String(question||'').trim())throw new Error('Photo challenge question not visible');
     const images=await Promise.all(tiles.map(t=>photoImageBase64(t.img.currentSrc||t.img.src)));
-    const prompt='Classify the eight separate photographs that follow, in their supplied order. '+
-      'For EACH photograph answer whether it depicts or is semantically related to the category: "'+
-      rule.category+'". Return exactly eight booleans in an array named matches, in image order. '+
-      'Mark true when related and false otherwise. Do NOT apply any NOT/inverse selection instruction; '+
-      'the application will do that after classification. Do not guess when uncertain.';
+    const prompt='Read and understand this exact image-selection question: '+JSON.stringify(String(question))+
+      '. Examine the eight separate photographs supplied in order. For EACH photograph decide whether '+
+      'a human following that exact question would SELECT it, including NOT, EXCEPT, ONLY, or any other negation. '+
+      'Return exactly eight booleans in an array named selections, one per image in order. '+
+      'True means select that image, false means do not select it. Do not simply label the category '+
+      'and do not reverse the instruction. Never guess if the question or images are unclear.';
     const input=[{type:'text',text:prompt}];
     for(let i=0;i<images.length;i++){
       input.push({type:'text',text:'Photograph '+(i+1)+' of 8'});
@@ -3885,8 +3879,8 @@ async function garageApiSweep() {
       model:GEMINI_MODEL,input,store:false,
       response_format:{
         type:'text',mime_type:'application/json',
-        schema:{type:'object',properties:{matches:{type:'array',items:{type:'boolean'}}},
-          required:['matches']}
+        schema:{type:'object',properties:{selections:{type:'array',items:{type:'boolean'}}},
+          required:['selections']}
       }
     };
     let response=null,lastError=null;
@@ -3932,10 +3926,10 @@ async function garageApiSweep() {
     }
     let parsed;
     try{parsed=JSON.parse(raw);}catch{throw new Error('Gemini classification was not valid JSON');}
-    const bits=parsed?.matches;
+    const bits=parsed?.selections;
     if(!Array.isArray(bits)||bits.length!==8||bits.some(v=>typeof v!=='boolean'))
-      throw new Error('Gemini returned no usable eight-image boolean classification');
-    const chosen=bits.flatMap((related,i)=>(rule.negative?!related:related)?[tiles[i].index]:[]);
+      throw new Error('Gemini returned no usable eight-image selection answer');
+    const chosen=bits.flatMap((selected,i)=>selected?[tiles[i].index]:[]);
     if(!chosen.length||chosen.length===8)
       throw new Error('Photo classification ambiguous (0 or 8 matching tiles); refusing to submit');
     return chosen;
@@ -3947,10 +3941,12 @@ async function garageApiSweep() {
     target.click();
   }
   async function tryPhotoChallenge(dom,key){
-    const rule=photoChallengeRule(dom.instruction);
-    if(!rule)return false;
     const tiles=photoTiles();
-    if(tiles.length!==8){solverStatusOnce('Photo grid not ready (expected eight individual tiles)');return true;}
+    if(tiles.length!==8)return false;
+    if(!String(dom.instruction||'').trim()){
+      solverStatusOnce('Photo grid visible but question is missing — manual verification required');
+      return true;
+    }
     if(!dom.button){solverStatusOnce('Photo challenge verification button not found');return true;}
     if(challengeSolving||attemptedSolves.has(key)||Date.now()<(photoRetryAfter.get(key)||0))return true;
     challengeSolving=true;attemptedSolves.add(key);
@@ -4525,7 +4521,7 @@ async function garageApiSweep() {
       return;
     }
     if (S.running && (!S.scheduler.singleTab || canRunTab()) && !st.challenge) onChallenge();
-    const kind = CHALLENGE_TYPES.find(([re]) => re.test(dom.instruction))?.[1] || 'Unknown challenge';
+    const kind = photoTiles().length === 8 ? 'Photographic question' : (CHALLENGE_TYPES.find(([re]) => re.test(dom.instruction))?.[1] || 'Unknown challenge');
     const info = `${kind}: ${dom.instruction || 'Instruction not found'}`;
     if (S.challengeAssist && info !== lastChallengeInfo) {
       lastChallengeInfo = info;
@@ -5612,7 +5608,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.42-test loaded — expanded photo challenge wording', 'info');
+    log('Mobsteria Bot V2.3.43-test loaded — Gemini reads full photo question', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
