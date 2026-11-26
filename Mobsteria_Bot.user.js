@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.41-test
+// @version      2.3.42-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3728,7 +3728,7 @@ async function garageApiSweep() {
    *  Unknown/ambiguous challenges remain manual.
    * ========================================================= */
   const CHALLENGE_TYPES = [
-    [/\bselect\s+all\s+images\s+(?:not\s+)?related\s+to\s+/i, 'Photographic category'],
+    [/\bselect\s+all\s+(?:the\s+)?images\s+(?:(?:not\s+)?related\s+to|of|containing|showing|with)\s+/i, 'Photographic category'],
     [/\b(?:click|select)\s+the\s+group\s+(?:with|showing|containing|that\s+has)\s+(?:exactly\s+)?\d+\s+(?:items|shapes|objects)\b/i, 'Group counting'],
     [/\b(?:click|select)\s+(?:all\s+)?(?:the\s+)?(?:red|yellow|green|blue|purple|orange|pink)\b/i, 'Colour selection'],
     [/\b(?:click|select)\s+all\s+(?:the\s+)?(?:triangles?|circles?|squares?|stars?|hexagons?|diamonds?)\b/i, 'Shape selection'],
@@ -3763,7 +3763,7 @@ async function garageApiSweep() {
   const GEMINI_FALLBACK_MODEL='gemini-3.5-flash-lite';
   const photoRetryAfter=new Map();
   const photoRetryCount=new Map();
-  const PHOTO_RE=/\bselect\s+all\s+images\s+(not\s+)?related\s+to\s+([a-z -]+?)[.!]?\s*$/i;
+  const PHOTO_RE=/^\s*select\s+all\s+(?:the\s+)?images\s+(?:(not\s+)?related\s+to\s+|(?:of|containing|showing|with)\s+)(?:a\s+|an\s+|the\s+)?([a-z][a-z -]*?)[.!]?\s*$/i;
   function photoChallengeRule(question){
     const m=String(question||'').match(PHOTO_RE);
     return m?{negative:!!m[1],category:m[2].trim().replace(/[.]+$/,'')}:null;
@@ -5612,7 +5612,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.41-test loaded — WebP challenge tile recognition corrected', 'info');
+    log('Mobsteria Bot V2.3.42-test loaded — expanded photo challenge wording', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
