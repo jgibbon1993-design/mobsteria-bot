@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.43-test
+// @version      2.3.44-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3940,6 +3940,33 @@ async function garageApiSweep() {
     if(!target||!target.getClientRects().length)throw new Error('Photo tile not clickable');
     target.click();
   }
+  // The legacy photo grid marks selected cards with border-accent and an overlay.
+  // Its Verify label is localized and can change independently of the selected count.
+  // Read actual React-rendered card state instead of inferring it from button text.
+  function selectedPhotoIndices(tiles=photoTiles()){
+    if(tiles.length!==8)return null;
+    return tiles.filter(tile=>{
+      const card=tile.img.closest('.aspect-square.border-2')||tile.img.parentElement;
+      return !!card?.classList?.contains('border-accent');
+    }).map(tile=>tile.index).sort((a,b)=>a-b);
+  }
+  function equalPhotoIndices(actual,expected){
+    return Array.isArray(actual)&&actual.length===expected.length&&
+      actual.every((index,i)=>index===expected[i]);
+  }
+  async function waitForPhotoSelections(expected,originalUrls,question,timeoutMs=1900){
+    const sorted=[...expected].sort((a,b)=>a-b);
+    const started=now();
+    while(now()-started<timeoutMs){
+      const current=photoTiles();
+      if(current.length!==8||
+         current.map(t=>t.img.currentSrc||t.img.src).join('|')!==originalUrls||
+         challengeDom()?.instruction!==question)return false;
+      if(equalPhotoIndices(selectedPhotoIndices(current),sorted))return true;
+      await sleep(80);
+    }
+    return false;
+  }
   async function tryPhotoChallenge(dom,key){
     const tiles=photoTiles();
     if(tiles.length!==8)return false;
@@ -3951,7 +3978,8 @@ async function garageApiSweep() {
     if(challengeSolving||attemptedSolves.has(key)||Date.now()<(photoRetryAfter.get(key)||0))return true;
     challengeSolving=true;attemptedSolves.add(key);
     try{
-      if(selectionCount(dom)!==0)throw new Error('Grid already has selected tiles');
+      const alreadySelected=selectedPhotoIndices(tiles);
+      if(!equalPhotoIndices(alreadySelected,[]))throw new Error('Photo grid already has selected tiles; leaving manual selections untouched');
       const original=tiles.map(t=>t.img.currentSrc||t.img.src).join('|');
       log('Photo classification: '+dom.instruction,'info');
       const chosen=await classifyPhotoChallenge(dom.instruction,tiles);
@@ -3960,16 +3988,17 @@ async function garageApiSweep() {
         throw new Error('Challenge changed while AI was processing');
       for(let n=0;n<chosen.length;n++){
         clickPhotoTile(current.find(t=>t.index===chosen[n]));
-        const ok=await waitForSelectionCount(n+1,dom.img.currentSrc||dom.img.src,1700);
-        if(!ok)throw new Error('Photo tile click not confirmed by game');
+        const ok=await waitForPhotoSelections(chosen.slice(0,n+1),original,dom.instruction);
+        if(!ok)throw new Error('Photo tile selection did not match the game UI after click '+(n+1));
       }
       const submit=challengeDom()?.button;
-      if(!submit||submit.disabled||selectionCount(challengeDom())!==chosen.length)
-        throw new Error('Photo verification button not ready');
+      const selected=selectedPhotoIndices(photoTiles());
+      if(!submit||submit.disabled||!equalPhotoIndices(selected,[...chosen].sort((a,b)=>a-b)))
+        throw new Error('Photo verification not ready or selected tiles differ from Gemini answer');
       submit.click();log('Photo challenge submitted ('+chosen.length+' tiles); awaiting server confirmation','good');
     }catch(e){
       st.challengeRecoveryReason=String(e.message).slice(0,130);
-      if(e.transient && selectionCount(challengeDom())===0){
+      if(e.transient && equalPhotoIndices(selectedPhotoIndices(),[])){
         const failures=(photoRetryCount.get(key)||0)+1;
         photoRetryCount.set(key,failures);
         const delay=Math.min(300000,10000*Math.pow(2,Math.min(failures-1,5)))+Math.floor(Math.random()*3000);
@@ -5608,7 +5637,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.43-test loaded — Gemini reads full photo question', 'info');
+    log('Mobsteria Bot V2.3.44-test loaded — photo selection verified by tile state', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
