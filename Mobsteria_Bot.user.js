@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.40-test
+// @version      2.3.41-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -3742,7 +3742,7 @@ async function garageApiSweep() {
 
   function challengeDom() {
     const img = [...document.images].find(i =>
-      /\/storage\/temp\/(?:challenge_|\d+\/[0-7]\.png)|\/canvas\.png/i.test(i.src) || i.alt === 'Challenge');
+      /\/storage\/temp\/(?:challenge_|\d+\/[0-7]\.(?:png|webp))|\/canvas\.(?:png|webp)/i.test(i.src) || i.alt === 'Challenge');
     if (!img || !img.getClientRects().length) return null;
     const visible = e => !!e.getClientRects().length && !e.closest('#mbx');
     const nodes = [...document.querySelectorAll('p.text-text-light.bold-text, p, h2, h3, h4')]
@@ -3770,9 +3770,9 @@ async function garageApiSweep() {
   }
   function photoTiles(){
     const candidates=[...document.querySelectorAll('img')].filter(i=>
-      /\/storage\/temp\/\d+\/[0-7]\.png(?:\?|$)/i.test(i.currentSrc||i.src) && i.getClientRects().length && !i.closest('#mbx'));
+      /\/storage\/temp\/\d+\/[0-7]\.(?:png|webp)(?:\?|$)/i.test(i.currentSrc||i.src) && i.getClientRects().length && !i.closest('#mbx'));
     if(candidates.length!==8)return [];
-    return candidates.map(i=>({img:i,index:Number((i.currentSrc||i.src).match(/\/([0-7])\.png(?:\?|$)/)[1])})).sort((a,b)=>a.index-b.index);
+    return candidates.map(i=>({img:i,index:Number((i.currentSrc||i.src).match(/\/([0-7])\.(?:png|webp)(?:\?|$)/)[1])})).sort((a,b)=>a.index-b.index);
   }
   function photoApi(method,url,payload){
     return new Promise((resolve,reject)=>GM_xmlhttpRequest({method,url,timeout:25000,
@@ -3795,7 +3795,7 @@ async function garageApiSweep() {
     return new Promise((resolve,reject)=>GM_xmlhttpRequest({method:'GET',url,responseType:'arraybuffer',timeout:15000,
       onload:r=>{if(r.status!==200||!r.response)return reject(new Error('Tile fetch failed'));
         const bytes=new Uint8Array(r.response);let binary='';for(let n=0;n<bytes.length;n+=8192){binary+=String.fromCharCode(...bytes.subarray(n,n+8192));}
-        resolve(btoa(binary));},onerror:()=>reject(new Error('Tile download failed')),
+        resolve({data:btoa(binary),mimeType:/\.webp(?:\?|$)/i.test(url)?'image/webp':'image/png'});},onerror:()=>reject(new Error('Tile download failed')),
       ontimeout:()=>reject(new Error('Tile download timed out'))}));
   }
   // v2.3.35 experiment: documented ClassificationTask accepts ONE base64 image per task.
@@ -3877,7 +3877,7 @@ async function garageApiSweep() {
     const input=[{type:'text',text:prompt}];
     for(let i=0;i<images.length;i++){
       input.push({type:'text',text:'Photograph '+(i+1)+' of 8'});
-      input.push({type:'image',data:images[i],mime_type:'image/png'});
+      input.push({type:'image',data:images[i].data,mime_type:images[i].mimeType});
     }
     // Prefer a reliable low-latency model. If Google is temporarily overloaded,
     // retry once, then switch to the documented image-capable Flash-Lite model.
@@ -4561,7 +4561,7 @@ async function garageApiSweep() {
           location.assign('/game/gta');
           return;
         }
-        log('Challenge still has no visible PNG after page navigation. Automatic solving requires the game to display the puzzle.', 'warn');
+        log('Challenge still has no visible challenge image (PNG or WebP) after page navigation. Complete the puzzle manually if the game does not render it.', 'warn');
       }
     }
     while(st.challenge) {
@@ -5612,7 +5612,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.40-test loaded — Gemini REST response parsing corrected', 'info');
+    log('Mobsteria Bot V2.3.41-test loaded — WebP challenge tile recognition corrected', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
