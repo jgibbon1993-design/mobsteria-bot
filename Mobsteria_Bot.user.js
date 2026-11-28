@@ -1512,7 +1512,7 @@
       try{
         const after=await GET('/lab');
         if(workshopItemEnqueued(st.workshopPending,after)){
-          st.stats.crafts++;st.workshopPending=null;GM_setValue(WORKSHOP_PENDING_KEY,'null');
+          st.stats.crafts++;workshopDoubleClicks.clear();st.workshopPending=null;GM_setValue(WORKSHOP_PENDING_KEY,'null');
           log(`Workshop: item queued — ${item.name} (output pending history verification)`,'good');
         }else workshopWarn(`Item ${item.name}: queue request unconfirmed; no automatic retry`);
       }catch{workshopWarn(`Item ${item.name}: queue check failed; no automatic retry`);}
