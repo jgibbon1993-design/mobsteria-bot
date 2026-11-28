@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.45-test
+// @version      2.3.46-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -1426,6 +1426,33 @@
   }
   function workshopVisible(el){return !!el?.getClientRects?.().length && !el.closest('#mbx') && !el.disabled && el.getAttribute?.('aria-disabled')!=='true';}
   function workshopTxt(el){return String(el?.innerText||el?.textContent||'').replace(/\s+/g,' ').trim();}
+  // Use game-owned UI to select double-chance modifiers. The non-empty
+  // modifier request payload has not been verified, so never guess it.
+  function workshopDoubleCrate(item){
+    return /\b(scrap|bullets?)\b.*\bcrates?\b|\bcrates?\b.*\b(scrap|bullets?)\b/i.test(String(item?.name||''));
+  }
+  const workshopDoubleNames=["Made Man's Toolcase",'Counterfeit Moulds'];
+  const workshopDoubleClicks=new Set();
+  function workshopDoubleChoice(dialog,name){
+    const controls=[...dialog.querySelectorAll('button,[role="button"],[role="checkbox"],label,[class*="cursor-pointer"]')]
+      .filter(workshopVisible).filter(el=>{
+        const t=workshopTxt(el);
+        return t.length>0&&t.length<160&&t.toLowerCase().includes(name.toLowerCase());
+      }).sort((a,b)=>workshopTxt(a).length-workshopTxt(b).length);
+    return controls[0]||null;
+  }
+  function workshopDoubleSelected(dialog,control,name){
+    if(control && (control.getAttribute('aria-pressed')==='true'||
+       control.getAttribute('aria-checked')==='true'||
+       control.getAttribute('data-state')==='checked'||
+       !!control.querySelector('input[type="checkbox"]:checked')))return true;
+    return [...dialog.querySelectorAll('p,span,div,small')].filter(workshopVisible)
+      .some(el=>{
+        const t=workshopTxt(el);
+        return t.length<180&&/^this craft\s*:/i.test(t)&&
+          t.toLowerCase().includes(name.toLowerCase());
+      });
+  }
   async function tryWorkshopItemUi(item, beforeLab) {
     if(now()-st.lastWorkshopUiStep<3000)return false;
     if(!/^\/game\/workshop(?:\/|$)/.test(location.pathname)) {
@@ -1448,6 +1475,32 @@
       .filter(workshopVisible);
     const modal=rootDialogs.find(x=>workshopTxt(x).includes(item.name));
     if(modal){
+      if(workshopDoubleCrate(item)){
+        if(!/workshop modifiers/i.test(workshopTxt(modal))){
+          workshopWarn(item.name+': modifier controls not visible; preserving crate materials');
+          return false;
+        }
+        const owned=workshopDoubleNames.map(name=>({name,control:workshopDoubleChoice(modal,name)}))
+          .filter(x=>x.control);
+        for(const mod of owned){
+          if(workshopDoubleSelected(modal,mod.control,mod.name))continue;
+          const key=String(item.id)+'|'+mod.name;
+          if(workshopDoubleClicks.has(key)){
+            workshopWarn(item.name+': double modifier selection not confirmed; not crafting yet');
+            return false;
+          }
+          workshopDoubleClicks.add(key);
+          st.lastWorkshopUiStep=now();mod.control.click();
+          log('Workshop: selecting '+mod.name+' for '+item.name,'info');
+          return true;
+        }
+        if(owned.length && !owned.every(x=>workshopDoubleSelected(modal,x.control,x.name))){
+          workshopWarn(item.name+': double modifier state unclear; not crafting');
+          return false;
+        }
+        if(owned.length)log('Workshop: '+item.name+' double modifiers selected: '+owned.map(x=>x.name).join(' + '),'info');
+        else log('Workshop: '+item.name+' has no available double-chance modifiers','info');
+      }
       const send=[...modal.querySelectorAll('button,[role="button"]')].filter(workshopVisible)
         .find(b=>/^(?:add(?:\s+to)?\s+queue|craft(?:\s+now)?|make)(?:\s+x?1)?$/i.test(workshopTxt(b)));
       if(!send){workshopWarn(`Item ${item.name}: detail shown but no verified Craft/Add to Queue control`);return false;}
@@ -1546,6 +1599,11 @@
           .sort((a,b)=>workshopItemScore(b)-workshopItemScore(a));
       if(list.length){
         const item=list[0];
+        if(workshopDoubleCrate(item)){
+          const counted=st.stats.crafts;
+          await tryWorkshopItemUi(item,lab);
+          return st.stats.crafts>counted || !!st.workshopPending;
+        }
         const before=workshopQueueIds(lab);
         const pending={at:now(),kind:'item',name:item.name,itemId:item.id,queuedBefore:before};
         // The 14 Nov manual HAR verifies POST /lab/craft {item_id,modifiers:[]}.
@@ -5694,7 +5752,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.45-test loaded — material-saving workshop priority', 'info');
+    log('Mobsteria Bot V2.3.46-test loaded — double modifiers for scrap and bullet crates', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
