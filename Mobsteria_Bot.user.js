@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.46-test
+// @version      2.3.47-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -342,6 +342,14 @@
   }
   S.delays.min=Math.max(1000,Math.min(60000,Number(S.delays.min)||2500));
   S.delays.max=Math.max(S.delays.min,Math.min(60000,Number(S.delays.max)||6000));
+  // Apply ranking-first mode once; preserve 90% resource burst thresholds.
+  if(!GM_getValue('mbx_v2347_rank_focus_migrated',false)){
+    S.scheduler.mode='xp';
+    S.scheduler.batchResources=true;
+    S.scheduler.alternateResources=false;
+    GM_setValue(STORE_KEY,JSON.stringify(S));
+    GM_setValue('mbx_v2347_rank_focus_migrated',true);
+  }
   function save() { GM_setValue(STORE_KEY, JSON.stringify(S)); }
   function safeParse(s) { try { return JSON.parse(s); } catch { return null; } }
 
@@ -1149,7 +1157,8 @@
     GM_setValue(CRIME_TURN_KEY,st.crimeNextType);
   }
   function mixedCrimeChoice(ranked){
-    if(!S.crimes.mixEnabled)return ranked[0]||null;
+    // XP focus chooses the best-rated crime instead of forcing variety.
+    if(S.scheduler.mode==='xp'||!S.crimes.mixEnabled)return ranked[0]||null;
     const kinds=crimeCycle(),wanted=preferredCrimeType();
     const start=Math.max(0,kinds.indexOf(wanted));
     for(let i=0;i<kinds.length;i++){
@@ -1169,10 +1178,11 @@
 
     const choices=[];
     // Parallel reads reduce latency without overlapping action POST requests.
-    const [pp,bi,sl]=await Promise.all([
+    const [pp,bi,sl,burglary]=await Promise.all([
       GET('/crimes2/pickpocketing'),
       S.crimes.breakins ? GET('/crimes2/car-breakins') : Promise.resolve(null),
-      GET('/crimes2/shoplifting')
+      GET('/crimes2/shoplifting'),
+      S.scheduler.mode==='xp'&&S.modules.burglary ? GET('/crimes2/burglary') : Promise.resolve(null)
     ]);
     for (const t of pp.targets || []) {
       if (num(t.nerve_cost)>available || num(t.time_remaining)<=4 || !t.target_hash) continue;
@@ -1196,9 +1206,21 @@
         url:`/crimes2/shoplifting/attempt/${s.id}`});
     }
 
+    // Include already-scouted burglaries in expected XP per nerve ranking.
+    if(burglary){
+      for(const t of (burglary.session?.scouted_targets||[])){
+        if(t.unique_id==null || !(num(t.nerve_cost)>0) ||
+          num(t.nerve_cost)>available || num(t.jail_chance)>num(S.burglary.maxJail) ||
+          (t.locked_until && new Date(t.locked_until).getTime()>=now()))continue;
+        choices.push({kind:'burglary',id:'burglary:'+(t.name||t.unique_id),
+          name:t.name||'burglary',data:t,cost:num(t.nerve_cost),
+          url:`/crimes2/burglary/attempt/${t.unique_id}`});
+      }
+    }
     const ranked=rankChoices(choices);
     // On the car turn, search once if the street needs refreshing.
-    if (S.crimes.mixEnabled && preferredCrimeType()==='car' && needsCarSearch && carSearchCost>0) {
+    if (S.scheduler.mode!=='xp' && S.crimes.mixEnabled &&
+        preferredCrimeType()==='car' && needsCarSearch && carSearchCost>0) {
       await POST('/crimes2/car-breakins/search');
       recordCrimeTurn('car');
       log('Crime rotation: searched a street for car break-ins','info');
@@ -3599,6 +3621,11 @@ async function garageApiSweep() {
   // scheduler turn; the earlier five-action inner loop could monopolise the
   // only scheduler and prevent focus/wit/nerve fairness.
   async function doCrimeGroup() {
+    if(S.scheduler.mode==='xp'){
+      if(await doCrimes())return true;
+      if(S.modules.burglary)return doBurglary();
+      return false;
+    }
     if(S.crimes.mixEnabled && S.modules.burglary && preferredCrimeType()==='burglary'){
       if(await doBurglary())return true;
     }
@@ -3636,8 +3663,11 @@ async function garageApiSweep() {
   // still controls the XP/money objective, but not the preferred activity order.
   // Deadlines and readiness guards can temporarily promote time-sensitive work.
   const USER_PRIORITY_ORDER = ['crimes','gta','heists','jobs','oc','workshop','gym','busting','smuggling','trading','garage','bullets','bosses','empire','mobpass','missions','dailies'];
+  const XP_PRIORITY_ORDER = ['crimes','gta','heists','busting','jobs','oc',
+    'dailies','missions','mobpass','bosses','gym','empire','workshop',
+    'smuggling','trading','bullets','garage'];
   const STRATEGY_ORDER = {
-    balanced: USER_PRIORITY_ORDER, xp: USER_PRIORITY_ORDER,
+    balanced: USER_PRIORITY_ORDER, xp: XP_PRIORITY_ORDER,
     money: USER_PRIORITY_ORDER, progression: USER_PRIORITY_ORDER,
   };
   const availableModule = Object.fromEntries(MODULE_ORDER);
@@ -3683,9 +3713,11 @@ async function garageApiSweep() {
     // Prevent indefinite starvation: any enabled, currently eligible module
     // which has not had a check for 2 minutes earns a fair turn. Respect
     // individual nextAllowed backoffs, resource refill and server rate limits.
+    const xpRush=S.scheduler.mode==='xp';
     const overdue=runOrder
       .filter(([key])=>S.modules[key] && at>=metric(key).nextAllowed &&
-        at-Number(metric(key).lastCheckAt||0)>=120000)
+        at-Number(metric(key).lastCheckAt||0)>=
+          (xpRush&&['trading','smuggling','garage','bullets','workshop'].includes(key)?600000:120000))
       .sort(([a],[b])=>Number(metric(a).lastCheckAt||0)-Number(metric(b).lastCheckAt||0))[0];
     if(overdue)raise(overdue[0]);
     const tradingDue=S.modules.trading && at>=metric('trading').nextAllowed &&
@@ -3693,8 +3725,9 @@ async function garageApiSweep() {
        (S.trading.loopTravel && tradingPair() &&
         (!st.tradeTravelReadyAt || st.tradeTravelReadyAt<=at)) ||
        at-Number(st.lastTradeCheck||0)>=120000);
-    if(tradingDue)raise('trading');
-    if(S.modules.smuggling && at-Number(st.lastSmuggleCheck||0)>=Number(S.smuggling.checkMinutes||5)*60000 &&
+    if(tradingDue && (!xpRush||tradePending()||tradeTravelPending()))raise('trading');
+    if(S.modules.smuggling && (!xpRush||st.smugglePending) &&
+       at-Number(st.lastSmuggleCheck||0)>=Number(S.smuggling.checkMinutes||5)*60000 &&
        at>=metric('smuggling').nextAllowed)raise('smuggling');
     // Every spendable resource deserves a turn, even when crimes are already
     // running successfully. Give ready nerve, focus and wit modules fair
@@ -4813,7 +4846,8 @@ async function garageApiSweep() {
               observeModule('jailtime','action',now()-began);
               st.stats.actions++;
               telemetryDirty = true;
-              st.nextAction = now() + rand(S.delays.min, S.delays.max);
+              st.nextAction = now() + (S.scheduler.mode==='xp'?rand(1200,2200):
+                rand(S.delays.min, S.delays.max));
               st.lastCharAt = 0;
               didAction = true;
               return;
@@ -4875,15 +4909,19 @@ async function garageApiSweep() {
         // V2.3.10: A successful action MUST NOT inherit the idle 20-60s
         // cadence. Continue the resource burst/next eligible module promptly.
         // Keep the server's Retry-After hold authoritative if one exists.
-        const actionGap=Math.max(250,rand(Number(S.delays.min)||2500,Number(S.delays.max)||6000));
+        const actionGap=S.scheduler.mode==='xp'?rand(1200,2200):
+          Math.max(250,rand(Number(S.delays.min)||2500,Number(S.delays.max)||6000));
         st.nextAction=Math.max(apiHoldUntil,now()+actionGap);
       }else{
         // All modules were empty or waiting for a real resource/cooldown.
         // Avoid repeatedly polling the server when no work is available.
         const eligibleTimes=moduleKeys().filter(k=>S.modules[k]).map(k=>metric(k).nextAllowed).filter(t=>t>now());
         const soonest=eligibleTimes.length ? Math.min(...eligibleTimes)-now() : Infinity;
-        const cadence=(Number(S.scheduler.idleCadenceSeconds)||60)*1000;
-        st.nextAction=now()+Math.max(20000,Math.min(cadence,soonest))+rand(0,3000);
+        const cadence=S.scheduler.mode==='xp'
+          ?Math.min(20000,(Number(S.scheduler.idleCadenceSeconds)||60)*1000)
+          :(Number(S.scheduler.idleCadenceSeconds)||60)*1000;
+        st.nextAction=now()+Math.max(S.scheduler.mode==='xp'?12000:20000,
+          Math.min(cadence,soonest))+rand(0,3000);
       }
 
     } catch (e) {
@@ -5752,7 +5790,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.46-test loaded — double modifiers for scrap and bullet crates', 'info');
+    log('Mobsteria Bot V2.3.47-test loaded — XP priority, 90% bursts preserved', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
