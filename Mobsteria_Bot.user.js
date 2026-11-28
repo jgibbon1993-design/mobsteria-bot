@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mobsteria Bot V2 + Local CAPTCHA
 // @namespace    kyle.mobsteria
-// @version      2.3.44-test
+// @version      2.3.45-test
 // @description  Automates Mobsteria: rotating crimes (pickpocket, car break-ins, shoplifting, burglary), GTA, heists, gym, jobs, mob bosses, dailies/contracts/syndicate, MOB Pass, organised crime, drug trading runs, drug crafting + smuggling, jail busts and jail-time activities. Adds configurable strategy scheduling, presets, telemetry and diagnostics while preserving the local CAPTCHA solver.
 // @match        https://mobsteria.com/*
 // @match        https://www.mobsteria.com/*
@@ -95,6 +95,7 @@
     // Drugs are a fallback when no affordable item craft is ready.
     drugs: [...DRUG_LIST],
     workshop: { useEnhancer: false, rotate: 0, itemsFirst: true,
+      saveForAdvanced: true, targetItemName: '',
       drugsFallback: true, navigateToItems: true, maxItemCost: 25000, keepCash: 50000 },
     smuggling: { minLoad: 20, autoTravelToComplete: true, minExpectedProfit: 1, keepCash: 50000, checkMinutes: 5, allowedDrugs: [...DRUG_LIST] },
     // Garage uses visible game controls only: no guessed garage endpoints.
@@ -243,6 +244,8 @@
     S.workshop=deepMerge(DEFAULTS.workshop,S.workshop||{});
     S.workshop.maxItemCost=Math.max(0,Number(S.workshop.maxItemCost)||0);
     S.workshop.keepCash=Math.max(0,Number(S.workshop.keepCash)||0);
+    S.workshop.saveForAdvanced=S.workshop.saveForAdvanced!==false;
+    S.workshop.targetItemName=String(S.workshop.targetItemName||'').trim().slice(0,80);
     S.crimes=deepMerge(DEFAULTS.crimes,S.crimes||{});
     S.oc=deepMerge(DEFAULTS.oc,S.oc||{});
     if(!Array.isArray(S.oc.roles))S.oc.roles=[4,2,3,5];
@@ -1374,6 +1377,45 @@
     if(objective()==='money')return success/(time*(1+price/10000));
     return success*(Number.isFinite(exp)?Math.max(0,exp)+0.02:0.02)/time/(1+price/50000);
   }
+  // Pick from all available recipes, not only items already craftable.
+  // Save for higher material requirements instead of consuming the stock first.
+  function workshopRecipeRequirements(item){
+    const list=item?.crafting_requirements;
+    if(!Array.isArray(list)||!list.length)return null;
+    const req=list.map((x,i)=>({
+      need:Number(x.quantity),have:Number(x.have_quantity),
+      name:String(x.name||x.material_name||x.item_name||('material '+(i+1)))
+    }));
+    return req.every(x=>Number.isFinite(x.need)&&x.need>0&&
+      Number.isFinite(x.have)&&x.have>=0)?req:null;
+  }
+  function workshopAdvancedGoal(lab){
+    if(!S.workshop.itemsFirst||!S.workshop.saveForAdvanced)return null;
+    const maxSeconds=Number(lab?.queue?.max_queue_duration);
+    const maxCost=num(S.workshop.maxItemCost);
+    const candidates=Object.values(lab?.craftable_items||{}).filter(x=>{
+      if(!x||x.locked||x.id==null||!String(x.name||'').trim())return false;
+      const requirements=workshopRecipeRequirements(x);
+      const price=Number(x.crafting_cost),seconds=Number(x.craft_time);
+      return requirements&&Number.isFinite(price)&&price>=0&&price<=maxCost&&
+        Number.isFinite(seconds)&&seconds>0&&Number.isFinite(maxSeconds)&&
+        maxSeconds>0&&seconds<=maxSeconds;
+    });
+    if(!candidates.length)return null;
+    const explicit=S.workshop.targetItemName.trim().toLowerCase();
+    let chosen=explicit?candidates.find(x=>String(x.name).trim().toLowerCase()===explicit):null;
+    if(explicit&&!chosen)workshopWarn('Target '+S.workshop.targetItemName+' not in unlocked, affordable recipes; using automatic advanced target');
+    if(!chosen){
+      candidates.sort((a,b)=>{
+        const ra=workshopRecipeRequirements(a), rb=workshopRecipeRequirements(b);
+        const total=x=>x.reduce((n,r)=>n+r.need,0);
+        return total(rb)-total(ra)||rb.length-ra.length||
+          num(b.exp_gained)-num(a.exp_gained)||String(a.name).localeCompare(String(b.name));
+      });
+      chosen=candidates[0];
+    }
+    return {item:chosen,requirements:workshopRecipeRequirements(chosen)};
+  }
   function workshopQueueIds(lab) {
     return (lab?.queue?.items||[]).map(x=>String(x.id??'')).filter(Boolean);
   }
@@ -1488,8 +1530,20 @@
       return false;
     }
     if(S.workshop.itemsFirst){
-      const list=Object.values(lab.craftable_items||{}).filter(x=>workshopItemEligible(x,lab))
-        .sort((a,b)=>workshopItemScore(b)-workshopItemScore(a));
+      const advanced=workshopAdvancedGoal(lab);
+      if(advanced && !workshopItemEligible(advanced.item,lab)){
+        const missing=advanced.requirements.filter(r=>r.have<r.need);
+        const shortage=missing.slice(0,2).map(r=>r.name+' '+r.have+'/'+r.need).join(', ');
+        const detail=missing.length
+          ?(advanced.requirements.length-missing.length)+'/'+advanced.requirements.length+
+            ' material types ready'+(shortage?' (need '+shortage+')':'')
+          :'materials ready; waiting for cash reserve or queue room';
+        workshopWarn('Saving for '+advanced.item.name+': '+detail+'. Not spending materials on smaller crafts');
+        return false; // Hold drug fallback while saving materials.
+      }
+      const list=advanced?[advanced.item]:
+        Object.values(lab.craftable_items||{}).filter(x=>workshopItemEligible(x,lab))
+          .sort((a,b)=>workshopItemScore(b)-workshopItemScore(a));
       if(list.length){
         const item=list[0];
         const before=workshopQueueIds(lab);
@@ -1519,7 +1573,7 @@
         if(accepted){
           st.stats.crafts++;
           st.workshopPending=null;GM_setValue(WORKSHOP_PENDING_KEY,'null');
-          log(`Workshop: ${item.name} added to queue (finished result pending)`,'good');
+          log(`Workshop: ${item.name} added to queue${advanced?' (advanced recipe priority)':''} (finished result pending)`,'good');
         }else workshopWarn(`${item.name}: submission response unverified; no duplicate craft`);
         st.lastWorkshopCheck=0;
         return true;
@@ -5402,6 +5456,9 @@ async function garageApiSweep() {
           <div class="mini-note">Repairs use the verified /garage/repair API and are checked against a fresh Garage snapshot. Maximum repair cost applies per car and the cash reserve is maintained. Door Panels upgrades still require visible priced controls. An uncertain repair result prevents another paid action until checked.</div>`),
         sec('drugs', 'Drugs, smuggling &amp; trading', `
           <div class="tog"><span>Craft affordable Items before drugs</span><div class="sw" data-b="workshop.itemsFirst"></div></div>
+          <div class="tog"><span>Save materials for advanced item recipes (recommended)</span><div class="sw" data-b="workshop.saveForAdvanced"></div></div>
+          <label class="f">Advanced item to save for (optional exact name)</label><input type="text" data-k="workshop.targetItemName" placeholder="Auto: most materials required">
+          <div class="mini-note">With saving enabled, the bot chooses the unlocked recipe with the most required materials (or your named target). It waits until all requirements and cash are ready instead of repeatedly spending materials on smaller items. Switch off to use the previous fast-crafting behaviour.</div>
           <div class="tog"><span>Craft selected drugs when no item is affordable</span><div class="sw" data-b="workshop.drugsFallback"></div></div>
           <div class="tog"><span>Open Workshop Items page when needed</span><div class="sw" data-b="workshop.navigateToItems"></div></div>
           <div class="row2"><div><label class="f">Max cash per item craft ($)</label><input type="number" min="0" data-k="workshop.maxItemCost"></div>
@@ -5637,7 +5694,7 @@ async function garageApiSweep() {
   function boot() {
     if (!document.body) return setTimeout(boot, 500);
     buildUI();
-    log('Mobsteria Bot V2.3.44-test loaded — photo selection verified by tile state', 'info');
+    log('Mobsteria Bot V2.3.45-test loaded — material-saving workshop priority', 'info');
     inspectChallenge();
     refreshChar(true).catch(() => {});
     log(S.running ? 'Loaded - bot is running' : 'Loaded - press Start', 'info');
